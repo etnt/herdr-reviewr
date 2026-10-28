@@ -396,7 +396,9 @@ impl Refresh {
     /// what every path diffs against, so only a full build is right.
     pub fn from_batch(batch: &crate::watch::Batch) -> Self {
         use crate::watch::GitChange;
-        if batch.rescan || batch.git.iter().any(|g| *g != GitChange::Index) {
+        // Another worktree coming or going changes nothing this one shows.
+        let moves_view = |g: &GitChange| !matches!(g, GitChange::Index | GitChange::Worktrees);
+        if batch.rescan || batch.git.iter().any(moves_view) {
             return Self::Full;
         }
         let index = batch.git.contains(&GitChange::Index);
@@ -597,6 +599,11 @@ mod tests {
                 Refresh::Paths { paths: paths(&["a", "b/c"]), index: false },
             ),
             ("the config alone", Batch { config: true, ..Batch::default() }, Refresh::default()),
+            (
+                "a worktree coming or going",
+                batch(&[GitChange::Worktrees], &[], false),
+                Refresh::default(),
+            ),
         ];
         for (name, batch, expected) in rows {
             assert_eq!(Refresh::from_batch(&batch), expected, "{name}");

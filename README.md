@@ -31,6 +31,7 @@ comment on lines, and send the comments back.
 - **Line comments** — on a line or a range, sent to the agent in one go.
 - **Text selection** — drag to copy, like an editor.
 - **File viewer** — any file in the worktree.
+- **Worktree switch** — follow your agent into another worktree with `W`.
 - **Search** — files by name and code by content, powered by [fff](https://github.com/dmtrKovalenko/fff).
 - **Find in file** — step through every match.
 - **PR view** — the branch's pull request, read-only.
@@ -102,6 +103,7 @@ Every key can be rebound ([Keybindings](#keybindings)).
 | `u` `b` `t` `g` | Scope: uncommitted / branch / last turn / commits |
 | `B` | Pick the base branch |
 | `G` | Pick commits |
+| `W` | Switch to another worktree of this repo |
 | `j` `k` · `↑` `↓` | Move |
 | `]` `[` | Next / previous change |
 | `f` `F` | Next / previous file |
@@ -268,6 +270,7 @@ keys help non-Latin layouts: bind the character your layout types on the same ke
 | `next-file` / `prev-file` | `f` / `F` |
 | `scope-uncommitted` / `scope-branch` / `scope-last-turn` / `scope-commits` | `u` / `b` / `t` / `g` |
 | `base-pick` / `commit-pick` | `B` / `G` |
+| `worktree-pick` | `W` |
 | `tab-changes` / `tab-all-files` / `tab-pr` | `1` / `2` / `3` |
 | `wrap` | `w` |
 | `rendered` | `m` |

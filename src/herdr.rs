@@ -48,6 +48,8 @@ pub struct AgentChoice {
     pub name: String,
     pub state: String,
     pub tab: String,
+    /// Where the agent works, so a review can name the worktree it is about.
+    pub cwd: Option<String>,
 }
 
 /// What `Send` does with the agents herdr reports; a refusal is [`send_target`]'s `Err`.
@@ -471,6 +473,7 @@ impl AgentPane {
             name: self.row_name(),
             state: self.row_state(),
             tab: tabs.get(&self.tab_id).cloned().unwrap_or_default(),
+            cwd: self.cwd.clone(),
         }
     }
 
@@ -544,6 +547,7 @@ fn parse_agents(json: &str) -> Result<Vec<AgentPane>, HerdrError> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentSample {
     pub cwd: Option<String>,
+    pub workspace: String,
     pub status: Status,
 }
 
@@ -580,7 +584,12 @@ fn samples_among(agents: Vec<AgentPane>, me: Option<&str>) -> Vec<(String, Agent
         .into_iter()
         .filter(|agent| agent.is_agent_other_than(me))
         .map(|agent| {
-            (agent.pane_id.clone(), AgentSample { status: agent.status(), cwd: agent.cwd })
+            let sample = AgentSample {
+                status: agent.status(),
+                cwd: agent.cwd,
+                workspace: agent.workspace_id,
+            };
+            (agent.pane_id, sample)
         })
         .collect()
 }
@@ -972,15 +981,18 @@ mod tests {
 
     #[test]
     fn sampling_keeps_every_tab_and_workspace() {
-        // Membership rides the agent's cwd, never its pane's tab or workspace.
+        // Membership is turn tracking's to decide, so every agent comes with its workspace.
         let agents = vec![
             AgentPane { cwd: Some("/w/one".into()), ..agent("w8:p1", "w8:t1", "w8") },
             AgentPane { cwd: Some("/w/two".into()), ..agent("w8:p2", "w8:t2", "w8") },
             AgentPane { cwd: Some("/w/three".into()), ..agent("w9:p1", "w9:t1", "w9") },
         ];
-        let cwds: Vec<_> =
-            super::samples_among(agents, None).into_iter().filter_map(|(_, s)| s.cwd).collect();
-        assert_eq!(cwds, ["/w/one", "/w/two", "/w/three"]);
+        let seats: Vec<_> = super::samples_among(agents, None)
+            .into_iter()
+            .map(|(_, s)| (s.cwd.unwrap(), s.workspace))
+            .collect();
+        let seat = |cwd: &str, ws: &str| (cwd.to_string(), ws.to_string());
+        assert_eq!(seats, [seat("/w/one", "w8"), seat("/w/two", "w8"), seat("/w/three", "w9")]);
     }
 
     #[test]
@@ -1063,12 +1075,14 @@ mod tests {
                     name: "claude".into(),
                     state: "working".into(),
                     tab: "Grip Outreach".into(),
+                    cwd: None,
                 },
                 AgentChoice {
                     pane_id: "w8:p2".into(),
                     name: "release-bot".into(),
                     state: "working".into(),
                     tab: String::new(),
+                    cwd: None,
                 },
             ]
         );

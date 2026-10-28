@@ -112,6 +112,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         Mode::Picker => Some(render_agent_picker),
         Mode::BasePick => Some(render_base_picker),
         Mode::CommitPick => Some(render_commit_picker),
+        Mode::WorktreePick => Some(render_worktree_picker),
         Mode::Normal | Mode::Composing { .. } | Mode::Search | Mode::Find => None,
     };
     if let Some(render_popup) = popup {
@@ -2856,6 +2857,12 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
         // The digits are literal; the movement keys are bound.
         A::MovePickerRow => (format!("1-9 {} {}", hint(K::Down), hint(K::Up)), "move"),
         A::BasePick => (hint(K::BasePick), "base"),
+        A::WorktreePick => (hint(K::WorktreePick), "worktrees"),
+        A::PickWorktreeRow => ("enter".into(), "switch"),
+        A::SwitchDiscard => {
+            let to = app.switch_question().map_or("", |c| c.name.as_str());
+            return (hint(K::WorktreePick), format!("switch to {to} ({} pending)", app.unsent()));
+        }
         A::CommitPick => (hint(K::CommitPick), "commits"),
         A::PickCommitRun => {
             let n = app.commit_picker.as_ref().map_or(0, crate::app::CommitPicker::run_len);
@@ -2887,7 +2894,7 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
         A::Wrap => (hint(K::Wrap), if app.wrap { "unwrap" } else { "wrap" }),
         A::Split => (hint(K::Split), if app.split_on_screen() { "unified" } else { "split" }),
         // Arrows, since every printable is query text here.
-        A::FindStep | A::MoveBaseRow | A::PickResult => ("↑↓".into(), "move"),
+        A::FindStep | A::MoveMenuRow | A::PickResult => ("↑↓".into(), "move"),
         A::FlipSearchMode => {
             // The label names the destination mode: `code` from Files, `files` from Code.
             let to_code =
@@ -3062,12 +3069,15 @@ fn footer_row1(app: &App, w: usize) -> (Vec<Span<'static>>, Vec<FooterAction>) {
     let status_tail =
         send_w + if do_acts.is_empty() { reserve } else { reserve.max(MORE_ELLIPSIS) };
     let free = w.saturating_sub(used + status_tail);
-    let status_w =
-        if app.status.is_empty() || app.confirming_quit || free < STATUS_FRAME + STATUS_MIN {
-            0
-        } else {
-            (STATUS_FRAME + app.status.width()).min(free)
-        };
+    let status_w = if app.status.is_empty()
+        || app.confirming_quit
+        || app.switch_question().is_some()
+        || free < STATUS_FRAME + STATUS_MIN
+    {
+        0
+    } else {
+        (STATUS_FRAME + app.status.width()).min(free)
+    };
 
     // Pack the actions; the rest spill to the `do` band.
     let mut overflow = Vec::new();
@@ -3277,6 +3287,74 @@ fn picker_inner(popup: Rect) -> Rect {
     Block::default().borders(Borders::ALL).inner(popup)
 }
 
+/// Clear `popup` and paint a menu's accent box titled `title`; the rows go in `picker_inner`.
+fn menu_box(frame: &mut Frame, p: &Palette, popup: Rect, title: &str) -> Rect {
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.mark(Ink::Accent, Fill::Base)))
+        .title(framed_title(title));
+    frame.render_widget(block, popup);
+    picker_inner(popup)
+}
+
+/// A filtered menu's filter line atop `inner`, scrolled to the caret; the list area below it.
+fn menu_filter(
+    frame: &mut Frame,
+    p: &Palette,
+    inner: Rect,
+    (query, caret): (&str, usize),
+    placeholder: &str,
+) -> Rect {
+    let prefix = " ";
+    // One cell of right margin keeps the scrolled query off the popup's border.
+    let avail = (inner.width as usize).saturating_sub(prefix.width() + 1);
+    let (filter_spans, caret_cell_col) = input_line(query, caret, avail, placeholder, p);
+    let mut filter = Line::from(filter_spans);
+    filter.spans.insert(0, Span::styled(prefix, text_style(p, Fill::Base)));
+    frame.render_widget(Paragraph::new(filter), Rect { height: 1, ..inner });
+    anchor_input_cursor(frame, inner, prefix.width() + caret_cell_col, 0);
+    Rect { y: inner.y + 1, height: inner.height.saturating_sub(1), ..inner }
+}
+
+/// A muted one-line note where a menu's rows would be.
+fn menu_note(frame: &mut Frame, p: &Palette, area: Rect, msg: &str) {
+    let note = Span::styled(msg, Style::default().fg(p.ink(Ink::TextMuted, Fill::Base)));
+    frame.render_widget(Paragraph::new(Line::from(note)), area);
+}
+
+const MENU_ROW_LEAD: &str = " ";
+/// Two cells between the name and the trail, so `feat/x  3d` never reads as one token.
+const MENU_TRAIL_GAP: usize = 2;
+
+/// Content width of a name-and-trail menu row: lead, name, gap, and trail.
+fn name_trail_width(name: &str, trail: &str) -> usize {
+    let trail_w = if trail.is_empty() { 0 } else { MENU_TRAIL_GAP + trail.width() };
+    MENU_ROW_LEAD.width() + name.width() + trail_w
+}
+
+/// A menu row `width` wide: a bright name and a right-aligned dim trail.
+fn name_trail_row(
+    p: &Palette,
+    name: String,
+    trail: &str,
+    width: usize,
+    on: Fill,
+) -> ListItem<'static> {
+    let pad = width.saturating_sub(name_trail_width(&name, trail));
+    let mut spans = vec![
+        Span::styled(MENU_ROW_LEAD.to_string(), text_style(p, on)),
+        Span::styled(name, text_style(p, on)),
+    ];
+    if !trail.is_empty() {
+        spans.push(Span::styled(
+            format!("{}{trail}", " ".repeat(pad + MENU_TRAIL_GAP)),
+            Style::default().fg(p.ink(Ink::TextMuted, on)),
+        ));
+    }
+    selectable_row(p, spans, width, on)
+}
+
 /// The names pad to the widest, so the dim tails start in one column.
 fn picker_name_width(app: &App) -> usize {
     app.picker_rows.iter().map(|row| row.name.width()).max().unwrap_or(0)
@@ -3302,14 +3380,7 @@ fn picker_scroll(app: &App, rows: usize) -> usize {
 
 fn render_agent_picker(frame: &mut Frame, app: &App, area: Rect) {
     let p = app.palette();
-    let popup = picker_popup(area, app);
-    frame.render_widget(Clear, popup);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(p.mark(Ink::Accent, Fill::Base)))
-        .title(framed_title(&picker_title(app)));
-    let inner = picker_inner(popup);
-    frame.render_widget(block, popup);
+    let inner = menu_box(frame, p, picker_popup(area, app), &picker_title(app));
 
     let name_width = picker_name_width(app);
     let first = picker_scroll(app, inner.height as usize);
@@ -3377,32 +3448,26 @@ fn base_trail_words(row: &crate::app::BaseChoice, now: u64) -> Vec<String> {
     words
 }
 
-const BASE_ROW_LEAD: &str = " ";
-/// Two cells between the name and the trail, so `feat/x  3d` never reads as one token.
-const BASE_TRAIL_GAP: usize = 2;
-
 /// A base row's name and trail for `width`: the trail sheds words before the name clips.
 fn base_row_parts(row: &crate::app::BaseChoice, width: usize, now: u64) -> (String, String) {
     let name = row_shown(row);
     let mut words = base_trail_words(row, now);
-    let avail = width.saturating_sub(BASE_ROW_LEAD.width());
     loop {
         let trail = words.join(" · ");
-        let trail_w = if trail.is_empty() { 0 } else { BASE_TRAIL_GAP + trail.width() };
-        if name.width() + trail_w <= avail {
+        if name_trail_width(&name, &trail) <= width {
             return (name, trail);
         }
         if words.pop().is_none() {
+            let avail = width.saturating_sub(MENU_ROW_LEAD.width());
             return (truncate_width(&name, avail), String::new());
         }
     }
 }
 
-/// Content width of one base-picker row at full length: lead, name, gap, and trail.
+/// Content width of one base-picker row at full length.
 fn base_row_width(row: &crate::app::BaseChoice, now: u64) -> usize {
     let (name, trail) = base_row_parts(row, usize::MAX, now);
-    let trail_w = if trail.is_empty() { 0 } else { BASE_TRAIL_GAP + trail.width() };
-    BASE_ROW_LEAD.width() + name.width() + trail_w
+    name_trail_width(&name, &trail)
 }
 
 /// The base picker's box, held at its full-list size while filtering, plus a probe hit's row.
@@ -3437,42 +3502,19 @@ fn render_base_picker(frame: &mut Frame, app: &App, area: Rect) {
     let Some(bp) = &app.base_picker else { return };
     let p = app.palette();
     let now = now_unix();
-    let popup = base_picker_popup(area, app, now);
-    frame.render_widget(Clear, popup);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(p.mark(Ink::Accent, Fill::Base)))
-        .title(framed_title(&base_picker_title(bp)));
-    let inner = picker_inner(popup);
-    frame.render_widget(block, popup);
+    let inner = menu_box(frame, p, base_picker_popup(area, app, now), &base_picker_title(bp));
     if inner.height == 0 {
         return;
     }
-
-    // The filter line, scrolled to keep the caret in view.
-    let prefix = " ";
-    // One cell of right margin keeps the scrolled query off the popup's border.
-    let avail = (inner.width as usize).saturating_sub(prefix.width() + 1);
-    let (filter_spans, caret_cell_col) =
-        input_line(&bp.query, bp.caret, avail, "Filter or type a revision…", p);
-    let mut filter = Line::from(filter_spans);
-    filter.spans.insert(0, Span::styled(prefix, text_style(p, Fill::Base)));
-    frame.render_widget(Paragraph::new(filter), Rect { height: 1, ..inner });
-    anchor_input_cursor(frame, inner, prefix.width() + caret_cell_col, 0);
-
-    let list_area = Rect { y: inner.y + 1, height: inner.height.saturating_sub(1), ..inner };
+    let placeholder = "Filter or type a revision…";
+    let list_area = menu_filter(frame, p, inner, (&bp.query, bp.caret), placeholder);
     let visible = bp.visible();
     if visible.is_empty() {
-        let msg = if bp.query.is_empty() {
-            " type a revision"
+        if bp.query.is_empty() {
+            menu_note(frame, p, list_area, " type a revision");
         } else if matches!(bp.probe, crate::app::BaseProbe::Miss) {
-            " no branches match"
-        } else {
-            return;
-        };
-        let none =
-            Line::from(Span::styled(msg, Style::default().fg(p.ink(Ink::TextMuted, Fill::Base))));
-        frame.render_widget(Paragraph::new(none), list_area);
+            menu_note(frame, p, list_area, " no branches match");
+        }
         return;
     }
     let width = list_area.width as usize;
@@ -3483,23 +3525,8 @@ fn render_base_picker(frame: &mut Frame, app: &App, area: Rect) {
         .skip(first)
         .take(list_area.height as usize)
         .map(|(vi, row)| {
-            // A bright name and a right-aligned dim trail.
-            let on = cursor_fill(vi == bp.cursor);
-            let lead = BASE_ROW_LEAD;
-            let (label, trail) = base_row_parts(row, width, now);
-            let gap = if trail.is_empty() { 0 } else { BASE_TRAIL_GAP };
-            let pad = width.saturating_sub(lead.width() + label.width() + gap + trail.width());
-            let mut spans = vec![
-                Span::styled(lead.to_string(), text_style(p, on)),
-                Span::styled(label, text_style(p, on)),
-            ];
-            if !trail.is_empty() {
-                spans.push(Span::styled(
-                    format!("{}{trail}", " ".repeat(pad + gap)),
-                    Style::default().fg(p.ink(Ink::TextMuted, on)),
-                ));
-            }
-            selectable_row(p, spans, width, on)
+            let (name, trail) = base_row_parts(row, width, now);
+            name_trail_row(p, name, &trail, width, cursor_fill(vi == bp.cursor))
         })
         .collect();
     frame.render_widget(List::new(items), list_area);
@@ -3511,6 +3538,76 @@ pub fn hit_base_picker_row(area: Rect, app: &App, col: u16, row: u16) -> Option<
     let inner = picker_inner(base_picker_popup(area, app, now_unix()));
     let first = base_picker_scroll(bp, inner.height.saturating_sub(1) as usize);
     menu_hit(inner, 1, first, bp.visible().len(), col, row)
+}
+
+// --- Worktree picker -----------------------------------------
+
+/// A worktree row's name and trail for `width`: the path clips from its start before the name.
+fn worktree_row_parts(row: &crate::app::WorktreeChoice, width: usize) -> (String, String) {
+    let mark = if row.current { "● current  " } else { "" };
+    let room =
+        width.saturating_sub(name_trail_width(&row.name, "") + MENU_TRAIL_GAP + mark.width());
+    (row.name.clone(), format!("{mark}{}", elide_head(&row.shown_path, room)))
+}
+
+fn worktree_row_width(row: &crate::app::WorktreeChoice) -> usize {
+    let (name, trail) = worktree_row_parts(row, usize::MAX);
+    name_trail_width(&name, &trail)
+}
+
+/// The worktree picker's title: the count, or `matched/total` while filtering.
+fn worktree_picker_title(wp: &crate::app::WorktreePicker) -> String {
+    let total = wp.rows.len();
+    if wp.query.is_empty() {
+        format!("worktrees · {total}")
+    } else {
+        format!("worktrees · {}/{total}", wp.visible().len())
+    }
+}
+
+/// The worktree picker's box, held at its full-list size while filtering.
+fn worktree_picker_popup(area: Rect, app: &App) -> Rect {
+    let Some(wp) = &app.worktree_picker else { return Rect::default() };
+    let widest = wp.rows.iter().map(worktree_row_width).max().unwrap_or(0);
+    menu_popup(area, app, widest, &worktree_picker_title(wp), wp.rows.len().max(1) + 3)
+}
+
+fn render_worktree_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(wp) = &app.worktree_picker else { return };
+    let p = app.palette();
+    let inner = menu_box(frame, p, worktree_picker_popup(area, app), &worktree_picker_title(wp));
+    if inner.height == 0 {
+        return;
+    }
+    let placeholder = "Filter by branch or path…";
+    let list_area = menu_filter(frame, p, inner, (&wp.query, wp.caret), placeholder);
+    let visible = wp.visible();
+    if visible.is_empty() {
+        menu_note(frame, p, list_area, " no worktrees match");
+        return;
+    }
+    let width = list_area.width as usize;
+    let first = menu_scroll(wp.cursor, visible.len(), list_area.height as usize);
+    let items: Vec<ListItem> = visible
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(list_area.height as usize)
+        .map(|(vi, row)| {
+            let (name, trail) = worktree_row_parts(row, width);
+            name_trail_row(p, name, &trail, width, cursor_fill(vi == wp.cursor))
+        })
+        .collect();
+    frame.render_widget(List::new(items), list_area);
+}
+
+/// The filtered worktree-picker row under the pointer, the filter line skipped.
+pub fn hit_worktree_picker_row(area: Rect, app: &App, col: u16, row: u16) -> Option<usize> {
+    let wp = app.worktree_picker.as_ref()?;
+    let inner = picker_inner(worktree_picker_popup(area, app));
+    let visible = wp.visible().len();
+    let first = menu_scroll(wp.cursor, visible, inner.height.saturating_sub(1) as usize);
+    menu_hit(inner, 1, first, visible, col, row)
 }
 
 // --- Commit picker -------------------------------------------
@@ -3631,26 +3728,12 @@ fn render_commit_picker(frame: &mut Frame, app: &App, area: Rect) {
     let Some(cp) = &app.commit_picker else { return };
     let p = app.palette();
     let parts = commit_row_parts(app, cp);
-    let popup = commit_picker_popup(area, app, &parts);
-    frame.render_widget(Clear, popup);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(p.mark(Ink::Accent, Fill::Base)))
-        .title(framed_title(&cp.title));
-    let inner = picker_inner(popup);
-    frame.render_widget(block, popup);
+    let inner = menu_box(frame, p, commit_picker_popup(area, app, &parts), &cp.title);
     if inner.height == 0 {
         return;
     }
     if cp.is_empty() {
-        let msg = format!(" {}", cp.empty);
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                msg,
-                Style::default().fg(p.ink(Ink::TextMuted, Fill::Base)),
-            )),
-            inner,
-        );
+        menu_note(frame, p, inner, &format!(" {}", cp.empty));
         return;
     }
     let width = inner.width as usize;

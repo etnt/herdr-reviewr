@@ -186,17 +186,23 @@ impl BaseChoice {
     }
 }
 
+/// The indices of `haystacks` that `query` fuzzily matches, best first, ties in input order.
+fn fuzzy_order<S: AsRef<str>>(query: &str, haystacks: &[S]) -> Vec<usize> {
+    if query.is_empty() {
+        return (0..haystacks.len()).collect();
+    }
+    let haystacks: Vec<&str> = haystacks.iter().map(AsRef::as_ref).collect();
+    // The default sort is score descending, then input order: the tie rule above.
+    let config = neo_frizbee::Config::default();
+    let matches = neo_frizbee::Matcher::new(query, &config).match_list(&haystacks);
+    matches.into_iter().map(|m| m.index as usize).collect()
+}
+
 impl BasePicker {
     /// Rows the query fuzzily matches, best first, ties in frozen order.
     pub fn filtered(&self) -> Vec<usize> {
-        if self.query.is_empty() {
-            return (0..self.rows.len()).collect();
-        }
         let names: Vec<&str> = self.rows.iter().map(BaseChoice::name).collect();
-        // The default sort is score descending, then input order: the tie rule above.
-        let config = neo_frizbee::Config::default();
-        let matches = neo_frizbee::Matcher::new(self.query.as_str(), &config).match_list(&names);
-        matches.into_iter().map(|m| m.index as usize).collect()
+        fuzzy_order(&self.query, &names)
     }
 
     /// Whether a row spells the query, any case, so no revision probe runs.
@@ -215,6 +221,40 @@ impl BasePicker {
             rows.push(probe);
         }
         rows
+    }
+}
+
+/// One worktree picker row: where the worktree is and how it reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeChoice {
+    pub path: PathBuf,
+    /// The branch, or `detached <sha>`.
+    pub name: String,
+    /// The path with the home directory as `~`.
+    pub shown_path: String,
+    pub current: bool,
+}
+
+/// The open worktree picker: this clone's worktrees, the current first, then by branch.
+#[derive(Clone, Debug)]
+pub struct WorktreePicker {
+    pub rows: Vec<WorktreeChoice>,
+    /// The highlighted row, an index into the visible view.
+    pub cursor: usize,
+    /// The typed filter, matching the branch or the path.
+    pub query: String,
+    /// The caret in `query`, a char index.
+    pub caret: usize,
+    /// The pick waiting on the switch question while comments are unsent.
+    pub confirming: Option<WorktreeChoice>,
+}
+
+impl WorktreePicker {
+    /// The rows the query fuzzily matches, best first, ties in listed order.
+    pub fn visible(&self) -> Vec<&WorktreeChoice> {
+        let haystacks: Vec<String> =
+            self.rows.iter().map(|r| format!("{} {}", r.name, r.shown_path)).collect();
+        fuzzy_order(&self.query, &haystacks).into_iter().map(|i| &self.rows[i]).collect()
     }
 }
 
@@ -326,6 +366,8 @@ pub enum Mode {
     BasePick,
     /// Choosing the `commits` scope's pick.
     CommitPick,
+    /// Choosing the worktree to switch the pane to.
+    WorktreePick,
     /// The search screen, replacing the body.
     Search,
     /// The read pane's foot band: find in the file, or a line to jump to.
@@ -337,7 +379,12 @@ impl Mode {
     pub fn is_modal(&self) -> bool {
         matches!(
             self,
-            Mode::Composing { .. } | Mode::List | Mode::Picker | Mode::BasePick | Mode::CommitPick
+            Mode::Composing { .. }
+                | Mode::List
+                | Mode::Picker
+                | Mode::BasePick
+                | Mode::CommitPick
+                | Mode::WorktreePick
         )
     }
 }
@@ -551,7 +598,14 @@ pub enum FooterAction {
     BasePick,
     /// The base picker's bar.
     PickBaseRow,
-    MoveBaseRow,
+    /// The arrows of a filtered menu, the base and worktree pickers.
+    MoveMenuRow,
+    /// Open the worktree picker.
+    WorktreePick,
+    /// The worktree picker's bar.
+    PickWorktreeRow,
+    /// The switch question's answer that switches, naming the comments still pending.
+    SwitchDiscard,
     /// Open the commit picker.
     CommitPick,
     /// The commit picker's bar.
@@ -716,6 +770,8 @@ pub struct App {
     pub last_sent_pane: Option<String>,
     /// The base picker's rows, filter, and highlight while `Mode::BasePick` is open
     pub base_picker: Option<BasePicker>,
+    /// The worktree picker while `Mode::WorktreePick` is open.
+    pub worktree_picker: Option<WorktreePicker>,
     pub mode: Mode,
     pub input: String,
     /// The comment editor's caret: a char index into `input` (`0..=chars().count()`).
@@ -726,6 +782,14 @@ pub struct App {
     pub should_quit: bool,
     /// Quit pressed with unsent comments; the next input answers (#119). Beside [`Mode`], not one.
     pub confirming_quit: bool,
+    /// The worktree this pane restarts on when the frame loop next returns.
+    pub switch_to: Option<WorktreeChoice>,
+    /// The worktree the pane opened in, which a switch never changes.
+    pub opened_in: PathBuf,
+    /// This clone's git common dir, asked of git once; `None` outside a repo.
+    common_dir: std::cell::OnceCell<Option<PathBuf>>,
+    /// Whether the last listing held another worktree to switch to; `None` until first listed.
+    other_worktrees: Option<bool>,
     /// The read-only `PR` tab's view of the pull request.
     pub pr: forge::PrView,
     /// The resolved target's forge, which picks the display noun.
@@ -845,6 +909,7 @@ impl App {
         let last_turn = baseline.map_or(crate::turn::LastTurn::Waiting, crate::turn::LastTurn::At);
         let theme = theme::resolve(None);
         Self {
+            opened_in: repo.clone(),
             repo,
             base,
             branch_base: git::BaseStatus::default(),
@@ -910,6 +975,7 @@ impl App {
             picker_over: Mode::Normal,
             last_sent_pane: None,
             base_picker: None,
+            worktree_picker: None,
             mode: Mode::Normal,
             input: String::new(),
             caret: 0,
@@ -917,6 +983,9 @@ impl App {
             keys_expanded: false,
             should_quit: false,
             confirming_quit: false,
+            switch_to: None,
+            common_dir: std::cell::OnceCell::new(),
+            other_worktrees: None,
             pr: forge::PrView::Pending,
             pr_forge: crate::git::Forge::GitHub,
             pr_notice: None,
@@ -1001,6 +1070,7 @@ impl App {
         self.cancel_gesture();
         // The picker closes first, onto its mode, so the closers below tear that mode down.
         self.close_picker();
+        self.close_worktree_picker();
         self.close_search();
         self.close_find();
         self.config = PluginConfigState::Blocked { error };
@@ -1023,26 +1093,49 @@ impl App {
         }
     }
 
-    /// Carry the review into a recovered app: comments, and a draft with its frozen diff.
-    pub(crate) fn carry_authored_state_from(&mut self, old: &mut Self) {
-        self.store = std::mem::take(&mut old.store);
-        self.list_cursor = old.list_cursor;
-        // The footer expansion is one global toggle, carried regardless of the recovered mode
+    /// Carry the pane's layout: the footer expansion, the navigator, the split and the search split.
+    fn carry_layout_from(&mut self, old: &Self) {
         self.keys_expanded = old.keys_expanded;
-        // Session memory, like the comments.
-        self.last_sent_pane = old.last_sent_pane.take();
-        // The commit pick is session memory like the comments: replaced, never cleared
-        self.commit_pick = old.commit_pick.take();
         self.navigator_side_pct = old.navigator_side_pct;
         self.navigator_stack_pct = old.navigator_stack_pct;
         self.navigator_hidden = old.navigator_hidden;
-        // A pane born blocked never chose, so the recovered pane's seed stands.
+        // A pane born blocked never chose, so the new pane's seed stands.
         self.split_chosen = old.split_chosen.or(self.split_chosen);
         // A hidden navigator keeps focus on the read pane.
         if self.navigator_hidden {
             self.focus = Focus::Diff;
         }
         self.search_pct = old.search_pct;
+    }
+
+    /// Carry how the pane views, never what it reviews, into a pane switched to another worktree.
+    pub fn carry_view_from(&mut self, old: &mut Self) {
+        self.carry_layout_from(old);
+        self.wrap = old.wrap;
+        self.markdown_rendered = old.markdown_rendered;
+        // A commit pick names the old worktree's commits, so its scope stays behind.
+        if old.scope != Scope::Commits {
+            self.scope = old.scope;
+        }
+        self.opened_in.clone_from(&old.opened_in);
+        // What herdr said of the pane carries; what it said of the old worktree does not.
+        let pane =
+            std::mem::replace(&mut old.herdr, HerdrView::new(crate::turn::LastTurn::default()));
+        let fresh = std::mem::replace(&mut self.herdr, pane);
+        self.herdr.last_turn = fresh.last_turn;
+        self.herdr.agents_present = fresh.agents_present;
+    }
+
+    /// Carry the review into a recovered app: comments, and a draft with its frozen diff.
+    pub(crate) fn carry_authored_state_from(&mut self, old: &mut Self) {
+        self.store = std::mem::take(&mut old.store);
+        self.list_cursor = old.list_cursor;
+        self.carry_layout_from(old);
+        self.opened_in.clone_from(&old.opened_in);
+        // Session memory, like the comments.
+        self.last_sent_pane = old.last_sent_pane.take();
+        // The commit pick is session memory like the comments: replaced, never cleared
+        self.commit_pick = old.commit_pick.take();
         // What herdr reported is reported once; a recovered app keeps it.
         self.herdr =
             std::mem::replace(&mut old.herdr, HerdrView::new(crate::turn::LastTurn::default()));
@@ -1051,7 +1144,7 @@ impl App {
         let old_mode = old.mode.clone();
         match old_mode {
             // `set_config_error` already closed these.
-            Mode::Normal | Mode::Search | Mode::Find | Mode::Picker => {}
+            Mode::Normal | Mode::Search | Mode::Find | Mode::Picker | Mode::WorktreePick => {}
             Mode::List | Mode::Composing { .. } | Mode::BasePick | Mode::CommitPick => {
                 self.scope = old.scope;
                 self.tab = old.tab;
@@ -1194,6 +1287,10 @@ impl App {
     /// Build and reconcile synchronously; never touches comments or the draft.
     pub fn reload(&mut self) -> Result<()> {
         self.ensure_config_ready()?;
+        // Listed once here; the watcher reports worktrees coming and going after that.
+        if self.other_worktrees.is_none() {
+            self.relist_worktrees();
+        }
         // The `PR` tab has no file tree; a file tab reloads on return.
         if !self.tab.is_file_tab() {
             return Ok(());
@@ -3574,6 +3671,9 @@ impl App {
             Mode::Search => self.search.as_mut().map(|s| (&mut s.query, &mut s.caret)),
             Mode::Find => self.find.as_mut().map(|f| (&mut f.query, &mut f.caret)),
             Mode::BasePick => self.base_picker.as_mut().map(|b| (&mut b.query, &mut b.caret)),
+            Mode::WorktreePick => {
+                self.worktree_picker.as_mut().map(|w| (&mut w.query, &mut w.caret))
+            }
             Mode::Normal | Mode::List | Mode::Picker | Mode::CommitPick => None,
         }
     }
@@ -3599,6 +3699,13 @@ impl App {
         }
         if changed && self.mode == Mode::BasePick {
             self.refilter_base_picker(highlighted);
+        }
+        // A filter edit puts the highlight on the best match.
+        if changed
+            && self.mode == Mode::WorktreePick
+            && let Some(wp) = self.worktree_picker.as_mut()
+        {
+            wp.cursor = 0;
         }
     }
 
@@ -3696,11 +3803,16 @@ impl App {
             self.paste_line(text);
             return;
         }
+        // A paste answers the switch question as a stray key does: back to the picker, unapplied.
+        if self.switch_question().is_some() {
+            self.cancel_switch_question();
+            return;
+        }
         let mut norm = text.replace("\r\n", "\n").replace('\r', "\n");
         match self.mode {
             Mode::Search | Mode::Find => norm = norm.replace('\n', " "),
-            // No branch name holds a newline.
-            Mode::BasePick => norm.retain(|c| c != '\n'),
+            // No branch or worktree name holds a newline.
+            Mode::BasePick | Mode::WorktreePick => norm.retain(|c| c != '\n'),
             _ => {}
         }
         let norm: Vec<char> = norm.chars().collect();
@@ -3943,6 +4055,7 @@ impl App {
             | Mode::Picker
             | Mode::BasePick
             | Mode::CommitPick
+            | Mode::WorktreePick
             | Mode::Search
             | Mode::Find => None,
         }
@@ -4596,7 +4709,23 @@ impl App {
                 return vec![(A::PickAgent, Primary), (A::ClosePicker, Do), (A::MovePickerRow, Do)];
             }
             Mode::BasePick => {
-                return vec![(A::PickBaseRow, Primary), (A::ClosePicker, Do), (A::MoveBaseRow, Do)];
+                return vec![(A::PickBaseRow, Primary), (A::ClosePicker, Do), (A::MoveMenuRow, Do)];
+            }
+            // The switch question mirrors quit's.
+            Mode::WorktreePick if self.switch_question().is_some() => {
+                return vec![
+                    (A::SwitchDiscard, Primary),
+                    (A::Cancel, Do),
+                    (A::Send, Do),
+                    (A::Copy, Do),
+                ];
+            }
+            Mode::WorktreePick => {
+                return vec![
+                    (A::PickWorktreeRow, Primary),
+                    (A::ClosePicker, Do),
+                    (A::MoveMenuRow, Do),
+                ];
             }
             Mode::CommitPick => {
                 // Nothing listed: only the exit.
@@ -4759,6 +4888,10 @@ impl App {
         // The commit picker's key works on every file tab.
         if !out.iter().any(|&(a, _)| a == A::CommitPick) {
             out.push((A::CommitPick, Go));
+        }
+        // The worktree picker's key shows only where there is another worktree to switch to.
+        if self.has_other_worktrees() {
+            out.push((A::WorktreePick, Go));
         }
         out.push((A::Search, Go));
         // In-file find shows wherever the read pane has content to search.
@@ -4942,6 +5075,140 @@ impl App {
             probe: BaseProbe::Idle,
         });
         self.mode = Mode::BasePick;
+    }
+
+    /// Whether this clone has another worktree to switch to, as the picker would list it.
+    pub fn has_other_worktrees(&self) -> bool {
+        self.other_worktrees == Some(true)
+    }
+
+    /// List this clone's worktrees again for the footer, as the picker would list them.
+    pub fn relist_worktrees(&mut self) {
+        let others = self.worktree_rows().is_ok_and(|rows| rows.iter().any(|r| !r.current));
+        self.other_worktrees = Some(others);
+    }
+
+    /// This clone's worktrees as picker rows, listed from the common dir, which outlives any one.
+    fn worktree_rows(&self) -> Result<Vec<WorktreeChoice>, git::GitFail> {
+        let here = git::canonical(&self.repo);
+        let common = self.common_dir.get_or_init(|| git::git_dirs(&self.repo).map(|(_, c)| c));
+        let listed = git::worktrees(common.as_deref().unwrap_or(&self.repo))?;
+        Ok(listed
+            .into_iter()
+            .map(|c| {
+                let name = c.branch.unwrap_or_else(|| {
+                    format!(
+                        "detached {}",
+                        c.head.as_deref().map(git::abbreviate_oid).unwrap_or_default()
+                    )
+                });
+                WorktreeChoice {
+                    current: git::canonical(&c.path) == here,
+                    shown_path: home_relative(&c.path),
+                    path: c.path,
+                    name,
+                }
+            })
+            .collect())
+    }
+
+    /// Open the worktree picker on the current worktree; with nothing to switch to, stay silent.
+    pub fn open_worktree_picker(&mut self) {
+        if self.mode != Mode::Normal {
+            return;
+        }
+        let mut rows = match self.worktree_rows() {
+            Ok(rows) => rows,
+            Err(e) => {
+                self.status = e.0;
+                return;
+            }
+        };
+        // A fresh listing also corrects the footer, which no watcher event may have reached.
+        self.other_worktrees = Some(rows.iter().any(|r| !r.current));
+        if self.other_worktrees == Some(false) {
+            return;
+        }
+        rows.sort_by(|a, b| b.current.cmp(&a.current).then_with(|| a.name.cmp(&b.name)));
+        self.worktree_picker = Some(WorktreePicker {
+            rows,
+            cursor: 0,
+            query: String::new(),
+            caret: 0,
+            confirming: None,
+        });
+        self.mode = Mode::WorktreePick;
+    }
+
+    pub fn close_worktree_picker(&mut self) {
+        if self.mode == Mode::WorktreePick {
+            self.mode = Mode::Normal;
+        }
+        self.worktree_picker = None;
+    }
+
+    /// Move the highlight through the visible view.
+    pub fn worktree_picker_move(&mut self, delta: isize) {
+        let Some(wp) = self.worktree_picker.as_mut() else { return };
+        let len = wp.visible().len();
+        if len > 0 {
+            wp.cursor = step(wp.cursor.min(len - 1), delta, len);
+        }
+    }
+
+    /// Move the highlight to visible `row`, for a click. A row past the end is inert.
+    pub fn worktree_picker_goto(&mut self, row: usize) {
+        if let Some(wp) = self.worktree_picker.as_mut()
+            && row < wp.visible().len()
+        {
+            wp.cursor = row;
+        }
+    }
+
+    /// Pick the highlight: the current one closes, a gone one says so, and unsent comments ask.
+    pub fn worktree_picker_pick(&mut self) {
+        let Some(wp) = &self.worktree_picker else { return };
+        let Some(choice) = wp.visible().get(wp.cursor).map(|c| (*c).clone()) else { return };
+        if choice.current {
+            self.close_worktree_picker();
+        } else if choice.path.is_dir() && self.unsent() > 0 {
+            if let Some(wp) = self.worktree_picker.as_mut() {
+                wp.confirming = Some(choice);
+            }
+        } else {
+            self.request_switch(choice);
+        }
+    }
+
+    /// Close the picker and restart on `choice`, unless it vanished since the list was read.
+    fn request_switch(&mut self, choice: WorktreeChoice) {
+        self.close_worktree_picker();
+        if choice.path.is_dir() {
+            self.switch_to = Some(choice);
+        } else {
+            self.status = format!("worktree gone: {}", choice.shown_path);
+        }
+    }
+
+    /// The pick the switch question is asking about.
+    #[must_use]
+    pub fn switch_question(&self) -> Option<&WorktreeChoice> {
+        self.worktree_picker.as_ref()?.confirming.as_ref()
+    }
+
+    /// Answer the switch question by switching and dropping the unsent comments.
+    pub fn switch_discarding(&mut self) {
+        match self.worktree_picker.as_mut().and_then(|wp| wp.confirming.take()) {
+            Some(choice) => self.request_switch(choice),
+            None => self.close_worktree_picker(),
+        }
+    }
+
+    /// Answer the switch question by staying in the picker.
+    pub fn cancel_switch_question(&mut self) {
+        if let Some(wp) = self.worktree_picker.as_mut() {
+            wp.confirming = None;
+        }
     }
 
     pub fn close_base_picker(&mut self) {
@@ -5154,20 +5421,40 @@ impl App {
     /// Export to one decided pane; only a delivery records it as `last used`.
     fn export_to_agent(&mut self, agent: &AgentChoice) {
         let target = Agent { pane: agent.pane_id.clone(), name: agent.name.clone() };
-        if self.export(&target) {
+        let worktree = self.worktree_for(agent.cwd.as_deref());
+        if self.deliver(&target, worktree.as_deref()) {
             self.last_sent_pane = Some(agent.pane_id.clone());
         }
     }
 
-    /// Export every comment to `target`, consuming them only on success, which it returns.
+    /// The worktree a review to an agent at `cwd` names: this one, when the agent's is another.
+    fn worktree_for(&self, cwd: Option<&str>) -> Option<PathBuf> {
+        let cwd = cwd.map(std::path::Path::new).filter(|c| c.is_absolute())?;
+        let ours = git::canonical(&self.repo);
+        // An agent at this worktree's root, the common case, needs no git to say so.
+        if git::canonical(cwd) == ours {
+            return None;
+        }
+        let git::Worktree::Root(theirs) = git::worktree_of(cwd) else { return None };
+        (git::canonical(&theirs) != ours).then(|| self.repo.clone())
+    }
+
+    /// Export every comment to `target`; a switched pane's review names its worktree.
     pub fn export(&mut self, target: &dyn ExportTarget) -> bool {
+        let switched = git::canonical(&self.repo) != git::canonical(&self.opened_in);
+        let worktree = switched.then(|| self.repo.clone());
+        self.deliver(target, worktree.as_deref())
+    }
+
+    /// Export every comment to `target`, consuming them only on success, which it returns.
+    fn deliver(&mut self, target: &dyn ExportTarget, worktree: Option<&std::path::Path>) -> bool {
         if self.store.is_empty() {
             self.status = "no comments yet".to_string();
             return false;
         }
         let refs: Vec<&Comment> = self.store.iter().collect();
         let prefix = self.plugin_config().and_then(crate::config::PluginConfig::review_prefix);
-        let text = format_review(prefix, &refs);
+        let text = format_review(prefix, worktree, &refs);
         let n = refs.len();
         logln!("export ({n}) -> {} ::\n{text}", target.label());
         let delivered = match target.export(&text) {
@@ -5189,6 +5476,11 @@ impl App {
         }
         self.refresh_rendered();
         delivered
+    }
+
+    /// Whether the frame loop should return: to quit, or to restart on another worktree.
+    pub fn leaving(&self) -> bool {
+        self.should_quit || self.switch_to.is_some()
     }
 
     /// Quit, asking first while comments are unsent.
@@ -5243,6 +5535,14 @@ impl App {
 /// Each card's `(row, store index)`: under the last row its comment covers.
 fn cards_of(rows: &[(usize, Vec<usize>)]) -> Vec<(usize, usize)> {
     rows.iter().filter_map(|(ci, r)| r.last().map(|&last| (last, *ci))).collect()
+}
+
+/// `path` with the home directory written `~`.
+fn home_relative(path: &std::path::Path) -> String {
+    match dirs::home_dir().as_deref().and_then(|h| path.strip_prefix(h).ok()) {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
 }
 
 /// Step `cur` by `delta` within `0..n`, clamping at both ends.

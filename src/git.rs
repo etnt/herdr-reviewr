@@ -122,6 +122,18 @@ pub fn worktree_of(path: &Path) -> Worktree {
     }
 }
 
+/// `path`'s canonical git common dir, as `Root`, with [`worktree_of`]'s other two outcomes.
+pub fn common_dir_of(path: &Path) -> Worktree {
+    match git_command(path).args(["rev-parse", "--git-common-dir"]).output() {
+        Err(_) => Worktree::Unknown,
+        Ok(out) if !out.status.success() => Worktree::Outside,
+        Ok(out) => match String::from_utf8_lossy(&out.stdout).trim() {
+            "" => Worktree::Outside,
+            common => Worktree::Root(canonical(&path.join(common))),
+        },
+    }
+}
+
 /// The worktree's own git dir and the common dir, canonical; the same in a main checkout.
 pub fn git_dirs(repo: &Path) -> Option<(PathBuf, PathBuf)> {
     let out = git(repo, &["rev-parse", "--absolute-git-dir", "--git-common-dir"]).ok()?;
@@ -847,6 +859,55 @@ pub fn checked_out_branch(repo: &Path) -> Result<Option<String>, GitFail> {
     git_tristate(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
 }
 
+/// `path` as the OS resolves it, so two spellings of one directory compare equal.
+pub fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// One worktree of this clone: where it is, its `HEAD`, and its branch when one is checked out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Checkout {
+    pub path: PathBuf,
+    pub head: Option<String>,
+    pub branch: Option<String>,
+}
+
+/// This clone's worktrees in git's order, minus the bare (no files) and the prunable (no path).
+pub fn worktrees(repo: &Path) -> Result<Vec<Checkout>, GitFail> {
+    // No `-z`: it needs git 2.36, and the line form is the same fields.
+    Ok(parse_worktrees(&git_strict(repo, &["worktree", "list", "--porcelain"])?))
+}
+
+/// Read `git worktree list --porcelain`: a field per line, a blank line ending each record.
+fn parse_worktrees(out: &str) -> Vec<Checkout> {
+    let mut rows = Vec::new();
+    let mut record: Option<(Checkout, bool)> = None;
+    for field in out.lines() {
+        let (key, value) = field.split_once(' ').unwrap_or((field, ""));
+        match (key, record.as_mut()) {
+            ("", _) => {
+                if let Some((entry, false)) = record.take() {
+                    rows.push(entry);
+                }
+            }
+            ("worktree", _) => {
+                let entry = Checkout { path: PathBuf::from(value), head: None, branch: None };
+                record = Some((entry, false));
+            }
+            ("HEAD", Some((entry, _))) => entry.head = Some(value.to_string()),
+            ("branch", Some((entry, _))) => {
+                entry.branch = Some(value.strip_prefix("refs/heads/").unwrap_or(value).to_string());
+            }
+            ("bare" | "prunable", Some((_, skip))) => *skip = true,
+            _ => {}
+        }
+    }
+    if let Some((entry, false)) = record {
+        rows.push(entry);
+    }
+    rows
+}
+
 /// The `origin` remote-tracking tips as `(OID, bare name)`, `origin/HEAD` excluded.
 fn origin_tips(repo: &Path) -> Result<Vec<(String, String)>, GitFail> {
     Ok(remote_tips(repo, &["origin"])?.into_iter().map(|tip| (tip.oid, tip.name)).collect())
@@ -1500,7 +1561,7 @@ static OWN_REF_WRITES: Mutex<Vec<(PathBuf, &str, Option<String>)>> = Mutex::new(
 /// Note this process's write to the private ref `name` of `repo`, keyed by its canonical git dir.
 fn record_own_ref(repo: &Path, name: &'static str, value: Option<&str>) {
     let Ok(dir) = git_dir(repo) else { return };
-    let dir = dir.canonicalize().unwrap_or(dir);
+    let dir = canonical(&dir);
     let mut writes = OWN_REF_WRITES.lock().unwrap_or_else(PoisonError::into_inner);
     writes.retain(|(d, written, _)| !(*d == dir && *written == name));
     writes.push((dir, name, value.map(str::to_string)));
@@ -2520,6 +2581,31 @@ mod tests {
     };
 
     const NONE: ForgeHosts<'_> = ForgeHosts { github: None, gitlab: None, azure_devops: None };
+
+    #[test]
+    fn worktree_listing_keeps_checkouts_and_drops_bare_and_prunable() {
+        let out = concat!(
+            "worktree /r\nHEAD aaa\nbranch refs/heads/main\n\n",
+            "worktree /bare\nbare\n\n",
+            "worktree /w/detached\nHEAD bbb\ndetached\n\n",
+            "worktree /tmp/gone\nHEAD ddd\nbranch refs/heads/old\nprunable gitdir points nowhere\n\n",
+            // The last record, with no blank line after it.
+            "worktree /w/locked\nHEAD ccc\nbranch refs/heads/feat/x\nlocked why\n",
+        );
+        let rows = super::parse_worktrees(out);
+        let shown: Vec<_> = rows
+            .iter()
+            .map(|r| (r.path.to_str().unwrap(), r.head.as_deref(), r.branch.as_deref()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("/r", Some("aaa"), Some("main")),
+                ("/w/detached", Some("bbb"), None),
+                ("/w/locked", Some("ccc"), Some("feat/x")),
+            ]
+        );
+    }
 
     #[test]
     fn a_path_limited_build_merges_untracked_counts_and_never_shrinks_them() {

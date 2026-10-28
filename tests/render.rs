@@ -3059,7 +3059,13 @@ mod search_row_emphasis {
 // --- Agent picker ----------------------------------------------------
 
 fn agent_row(pane: &str, name: &str, state: &str, tab: &str) -> AgentChoice {
-    AgentChoice { pane_id: pane.into(), name: name.into(), state: state.into(), tab: tab.into() }
+    AgentChoice {
+        pane_id: pane.into(),
+        name: name.into(),
+        state: state.into(),
+        tab: tab.into(),
+        cwd: None,
+    }
 }
 
 /// One saved comment on the first added line, so the picker has a count to title itself with.
@@ -3363,6 +3369,34 @@ fn a_probe_row_still_fits_when_every_branch_matches() {
         .filter_map(|(col, row)| ui::hit_base_picker_row(AREA, &app, col, row))
         .collect();
     assert_eq!(rows.into_iter().collect::<Vec<_>>(), [0, 1], "the hit row is inside the box");
+}
+
+#[test]
+fn the_worktree_picker_paints_its_rows_and_clicks_land_on_them() {
+    let r = Repo::init();
+    r.write("hello.rs", "alpha\n");
+    r.commit_all("init");
+    let wt = r.add_worktree("company-pages");
+    let mut app = app_on(&r);
+    app.open_worktree_picker();
+
+    let frame = render(&app);
+    assert!(frame.contains("worktrees · 2"), "{frame}");
+    assert!(frame.contains("● current"), "{frame}");
+    let tail = wt.path().file_name().unwrap().to_str().unwrap();
+    let pages = frame.lines().find(|l| l.contains("company-pages")).expect("the other row");
+    assert!(pages.contains(&format!("/{tail}│")), "the path, right-aligned: {pages}");
+
+    let rows: std::collections::BTreeSet<usize> = (0..AREA.height)
+        .flat_map(|row| (0..AREA.width).map(move |col| (col, row)))
+        .filter_map(|(col, row)| ui::hit_worktree_picker_row(AREA, &app, col, row))
+        .collect();
+    assert_eq!(rows.into_iter().collect::<Vec<_>>(), [0, 1], "both rows, the filter line skipped");
+
+    // Narrow, the path gives way from its head and the branch stays whole.
+    let narrow = dump(&render_size(&app, 50, 20));
+    let pages = narrow.lines().find(|l| l.contains("company-pages")).expect("the other row");
+    assert!(pages.contains('…'), "{narrow}");
 }
 
 fn now_minus(secs: u64) -> u64 {

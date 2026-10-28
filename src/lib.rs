@@ -79,24 +79,29 @@ pub fn run() -> Result<()> {
     let mut terminal = ratatui::init();
     // `ratatui::init` claimed the screen and raw mode; the input modes are left.
     claim_input_modes();
-    // Paint before the first load, so a hung `git` never leaves herdr's blank pane (issue #4).
-    if let Err(error) = terminal.draw(|f| ui::render(f, &app)) {
-        restore_terminal();
-        return Err(error.into());
-    }
-    // A cosmetic label; identity is the process.
+    // A cosmetic label, stamped on its own thread; identity is the process.
     herdr::label_pane(&app.herdr.ids);
-    if initial_config.is_ok()
-        && let Err(e) = app.reload()
-    {
-        logln!("startup reload failed: {e:#}");
-        app.status = format!("load failed: {e}");
+    if let Err(error) = paint_then_load(&mut terminal, &mut app) {
+        restore_terminal();
+        return Err(error);
     }
     // An old command line hears what changed instead of quietly doing something else.
     if let Some(note) = &cfg.removed_flag {
         app.status.clone_from(note);
     }
-    let result = event_loop(&mut terminal, &mut app, &cfg);
+    // Window editors outlive a switch, so the next loop reaps them.
+    let mut open_editors = Vec::new();
+    let result = loop {
+        let result = event_loop(&mut terminal, &mut app, &cfg, &mut open_editors);
+        let Some(target) = app.switch_to.take().filter(|_| result.is_ok()) else { break result };
+        git::end_sessions();
+        cfg.repo.clone_from(&target.path);
+        app = switched_app(&cfg, &mut app, &target.name);
+        if let Err(error) = paint_then_load(&mut terminal, &mut app) {
+            restore_terminal();
+            break Err(error);
+        }
+    };
     herdr::clear_pane_label(&app.herdr.ids);
     git::end_sessions();
     result
@@ -268,6 +273,29 @@ fn ready_app(cfg: &Config, plugin_config: PluginConfig) -> App {
         app.wrap = wrap;
     }
     app
+}
+
+/// The pane restarted on `cfg.repo`, the worktree `name`: what a pane opened there would be,
+/// viewed as `old` viewed, not loaded yet.
+pub fn switched_app(cfg: &Config, old: &mut App, name: &str) -> App {
+    let plugin_config = config::plugin_config(cfg.plugin_config_dir.as_deref());
+    let mut app = app_for(cfg, &plugin_config);
+    app.carry_view_from(old);
+    // A toggle closes the pane, so the switch lasts exactly as long as it does.
+    app.status = format!("reviewing {name} until this pane closes");
+    app
+}
+
+/// Paint, then load, so a hung `git` never leaves a blank or stale pane (issue #4).
+fn paint_then_load(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
+    terminal.draw(|f| ui::render(f, app))?;
+    if app.config_error().is_none()
+        && let Err(e) = app.reload()
+    {
+        logln!("reload failed: {e:#}");
+        app.status = format!("load failed: {e}");
+    }
+    Ok(())
 }
 
 /// A transient status message (e.g. "sent 3 comments") fades after this long idle.
@@ -704,11 +732,11 @@ pub fn land_world_completion(
     }
 }
 
-/// Land what the watcher reported: the pacer, the PR probe and search follow it. Whether the
-/// config must be read again.
+/// Land what the watcher reported, which the pacer, PR probe, search and `W` hint follow.
+/// Whether the config must be read again.
 fn land_watch_event(
     event: crate::watch::WatchEvent,
-    app: &App,
+    app: &mut App,
     pacer: &mut crate::schedule::Pacer,
     pr: &mut PrCoordinator,
     search: Option<&mpsc::Sender<crate::search::SearchJob>>,
@@ -720,6 +748,7 @@ fn land_watch_event(
         WatchEvent::Ready => {
             pacer.set_watcher_down(false, now);
             pacer.on_batch(crate::world::Refresh::Full, now);
+            app.relist_worktrees();
             true
         }
         WatchEvent::Batch(batch) => {
@@ -731,6 +760,9 @@ fn land_watch_event(
             );
             if batch.git.iter().any(|g| g.moves_pr_input()) {
                 schedule_pr_probe(pr, app.tab);
+            }
+            if batch.rescan || batch.git.contains(&crate::watch::GitChange::Worktrees) {
+                app.relist_worktrees();
             }
             // The search engine has no watcher of its own: new ignore rules rescan it.
             let rules = batch.git.contains(&crate::watch::GitChange::IgnoreRules);
@@ -817,18 +849,23 @@ fn glyph_clears(lit_for: Duration) -> bool {
 }
 
 /// Draw, then sleep until input, a worker's result, or the nearest armed deadline.
-fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Result<()> {
+fn event_loop(
+    terminal: &mut DefaultTerminal,
+    app: &mut App,
+    cfg: &Config,
+    open_editors: &mut Vec<std::process::Child>,
+) -> Result<()> {
     // The config is read at the first frame and again only when the watcher says it changed.
     let mut config_dirty = true;
     // When the last mouse event came, and whether it sat on the pane's edge.
     let mut last_mouse = Instant::now();
     let mut mouse_exited = false;
     let mut last_pr_poll = Instant::now();
-    // The loop sleeps on terminal input and this wake, which every worker's result and (on unix)
-    // every window resize sets; nothing polls a channel.
-    let wake = crate::wake::Wake::new()?;
+    // The loop sleeps on input and this wake, rung only by its own workers and resizes.
+    // Failing before the guarded loop below, each restores the terminal itself.
+    let wake = crate::wake::Wake::new().inspect_err(|_| restore_terminal())?;
     #[cfg(unix)]
-    wake.sys().watch_resizes()?;
+    let _resizes = wake.sys().watch_resizes().inspect_err(|_| restore_terminal())?;
     let waker = wake.waker();
     // Probes and forge reads run on workers.
     let (probe_tx, probe_rx) = crate::wake::channel::<(
@@ -845,7 +882,9 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
     let _world_worker = crate::world::spawn(app.repo.clone(), world_job_rx, world_res_tx);
     // herdr pushes focus, this pane's moves, and agent statuses; outside herdr nothing connects.
     let (herdr_tx, herdr_rx) = crate::wake::channel::<crate::herdr_socket::HerdrEvent>(&waker);
-    let herdr = herdr::connection_target().and_then(|(socket, pane)| {
+    // The live pane id, since a move or an earlier switch may have left the environment's stale.
+    let herdr = herdr::connection_target().and_then(|(socket, launched)| {
+        let pane = app.herdr.ids.pane.clone().unwrap_or(launched);
         crate::herdr_socket::Connection::start(socket, pane, app.repo.clone(), herdr_tx)
             .inspect_err(|e| logln!("herdr connection did not start: {e}"))
             .ok()
@@ -863,8 +902,6 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
     let mut repaint_whole = false;
     // Input that showed the pane, held for the repaint; clicks aimed at the stale frame dropped.
     let mut held: std::collections::VecDeque<Event> = std::collections::VecDeque::new();
-    // Window editors reviewr launched, reaped at the next press.
-    let mut open_editors: Vec<std::process::Child> = Vec::new();
     // The last dispatched world job, which completions are tagged against.
     let mut world_live = LiveJob::default();
     // When a background refresh may run: batches gather, then wait out the debounce and the budget.
@@ -883,7 +920,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
     // Fetch the PR at open, so the tab is ready when visited.
     app.pr_pending = None;
     let result: Result<()> = (|| {
-        while !app.should_quit {
+        while !app.leaving() {
             if let Ok((epoch, target, mut recovered)) = recovery_rx.try_recv() {
                 recovery_inflight = false;
                 if epoch == config_epoch {
@@ -1389,9 +1426,9 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
                 app.tick_base_picker_probe();
             }
             if app.editor_request.is_some() {
-                run_editor(terminal, app, painted_frame.editor(), &mut open_editors)?;
+                run_editor(terminal, app, painted_frame.editor(), open_editors)?;
             }
-            if app.should_quit {
+            if app.leaving() {
                 break;
             }
             // Stillness inside the pane is a held button; only an edge exit completes.
@@ -1401,12 +1438,16 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
         }
         Ok(())
     })();
-    restore_terminal();
-    drain_pr_shutdown(&mut pr, &probe_rx, &pr_rx);
+    // A switch keeps the screen: the next loop paints over it, with no shell flash between.
+    // The process lives on through a switch, so dropping the coordinator cancels its fetch.
+    if result.is_err() || app.switch_to.is_none() {
+        restore_terminal();
+        drain_pr_shutdown(&mut pr, &probe_rx, &pr_rx);
+    }
     result
 }
 
-/// A click or a wheel turn: the mouse events that answer the quit question.
+/// A click or a wheel turn: the mouse events that answer the quit or switch question.
 fn answers_question(kind: MouseEventKind) -> bool {
     matches!(kind, MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown)
 }
@@ -1804,6 +1845,41 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
         return Ok(());
     }
 
+    // The switch question mirrors quit's: the bound switch key drops, `s`/`y` export and stay.
+    if app.switch_question().is_some() {
+        match action {
+            Some(K::WorktreePick) => app.switch_discarding(),
+            Some(K::Send) => {
+                app.close_worktree_picker();
+                app.send_to_agent();
+            }
+            Some(K::Copy) => {
+                app.close_worktree_picker();
+                app.export(&Clipboard);
+            }
+            _ => app.cancel_switch_question(),
+        }
+        return Ok(());
+    }
+
+    // Worktree picker: every printable filters, like the base picker; vertical keys move.
+    if app.mode == Mode::WorktreePick {
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let word = alt || ctrl;
+        match key.code {
+            Esc => app.close_worktree_picker(),
+            Enter => app.worktree_picker_pick(),
+            Down => app.worktree_picker_move(1),
+            Up => app.worktree_picker_move(-1),
+            PageDown => app.worktree_picker_move(PAGE),
+            PageUp => app.worktree_picker_move(-PAGE),
+            Char('n') if ctrl => app.worktree_picker_move(1),
+            Char('p') if ctrl => app.worktree_picker_move(-1),
+            code => apply_text_edit(app, code, ctrl, alt, word),
+        }
+        return Ok(());
+    }
+
     // Base picker: every printable filters, so a branch `qa` is typable; vertical keys move.
     if app.mode == Mode::BasePick {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -1850,6 +1926,7 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
             (Some(K::TabChanges), _) => app.set_tab(crate::app::Tab::Changes)?,
             (Some(K::TabAllFiles), _) => app.set_tab(crate::app::Tab::AllFiles)?,
             (Some(K::OpenPr), _) => app.pr_open(),
+            (Some(K::WorktreePick), _) => app.open_worktree_picker(),
             (Some(K::Search), _) => app.open_search(),
             (Some(K::NavigatorPosition), _) => app.cycle_navigator_position(),
             (Some(K::NavigatorGrow), _) => app.resize_navigator(4),
@@ -1929,6 +2006,7 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
             K::ScopeCommits => app.set_scope(Scope::Commits)?,
             K::BasePick => app.open_base_picker(),
             K::CommitPick => app.open_commit_picker(),
+            K::WorktreePick => app.open_worktree_picker(),
             K::Select => app.toggle_select(),
             K::Comment => app.start_comment(),
             // `delete` needs the diff focused, never an off-screen cursor; `edit` works anywhere.
@@ -2368,9 +2446,13 @@ fn dispatch_mouse(
     target: &dyn crate::export::ExportTarget,
 ) -> Result<()> {
     app.hover = Some((m.column, m.row));
-    // A click or wheel only answers the quit question; a gesture under way finishes.
+    // A click or wheel only answers a question, by staying; a gesture under way finishes.
     if app.confirming_quit && answers_question(m.kind) {
         app.confirming_quit = false;
+        return Ok(());
+    }
+    if app.switch_question().is_some() && answers_question(m.kind) {
+        app.cancel_switch_question();
         return Ok(());
     }
     // Buttonless motion or a new down proves the release was lost; complete it first.
@@ -2461,6 +2543,15 @@ fn dispatch_mouse(
                         app.base_picker_pick()?;
                     }
                     Some(i) => app.base_picker_goto(i),
+                    None => {}
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) if app.mode == Mode::WorktreePick => {
+                match ui::hit_worktree_picker_row(area, app, m.column, m.row) {
+                    Some(i) if app.worktree_picker.as_ref().is_some_and(|wp| wp.cursor == i) => {
+                        app.worktree_picker_pick();
+                    }
+                    Some(i) => app.worktree_picker_goto(i),
                     None => {}
                 }
             }
@@ -3593,5 +3684,67 @@ mod refresh_tests {
         assert_eq!(recovery_epoch, epoch);
         assert_eq!(target.theme(), "gruvbox");
         assert_eq!(recovered.plugin_config().unwrap().theme(), "gruvbox");
+    }
+
+    #[test]
+    fn the_w_hint_follows_the_watcher_reporting_worktrees() {
+        let (dir, git) = crate::test_support::test_repo();
+        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "a"]);
+        let mut app = App::new(dir.path().to_path_buf(), Scope::Uncommitted, None);
+        app.reload().unwrap();
+        let (mut pacer, mut pr) = (crate::schedule::Pacer::default(), PrCoordinator::new(true));
+        let mut land = |app: &mut App, event| {
+            super::land_watch_event(event, app, &mut pacer, &mut pr, None);
+            app.has_other_worktrees()
+        };
+        let linked = tempfile::tempdir().unwrap();
+        let wt = linked.path().join("wt");
+        git(&["worktree", "add", "-q", "-b", "other", wt.to_str().unwrap()]);
+        let paths =
+            crate::watch::Batch { worktree: ["a.txt".to_string()].into(), ..Default::default() };
+        assert!(!land(&mut app, crate::watch::WatchEvent::Batch(paths)), "an edit lists nothing");
+        let came = crate::watch::Batch {
+            git: [crate::watch::GitChange::Worktrees].into(),
+            ..Default::default()
+        };
+        assert!(land(&mut app, crate::watch::WatchEvent::Batch(came)), "a worktree came");
+        git(&["worktree", "remove", wt.to_str().unwrap()]);
+        assert!(!land(&mut app, crate::watch::WatchEvent::Ready), "the live watcher lists again");
+    }
+
+    #[test]
+    fn recovery_after_a_switch_rebuilds_on_the_worktree_on_screen() {
+        let (dir, git) = crate::test_support::test_repo();
+        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "a"]);
+        let linked = tempfile::tempdir().unwrap();
+        let wt = linked.path().join("wt");
+        git(&["worktree", "add", "-q", "-b", "other", wt.to_str().unwrap()]);
+        let config_dir = tempfile::tempdir().unwrap();
+        let opened = Config::parse([dir.path().display().to_string()]);
+        let mut old = crate::app_for(&opened, &Ok(crate::PluginConfig::default()));
+
+        let mut cfg = opened.clone();
+        cfg.repo.clone_from(&wt);
+        let mut app = crate::switched_app(&cfg, &mut old, "other");
+        app.set_config_error("unknown key".into());
+        let (tx, rx) = crate::wake::channel(&crate::wake::Waker::detached());
+        let (mut epoch, mut inflight) = (0, false);
+        apply_plugin_config_observation(
+            &mut app,
+            &cfg,
+            &mut epoch,
+            &tx,
+            &mut inflight,
+            plugin_config_in(config_dir.path()),
+        );
+        let (_, _, mut recovered) = rx.recv_timeout(Duration::from_secs(5)).expect("recovery");
+        recovered.carry_authored_state_from(&mut app);
+        let canonical = crate::git::canonical;
+        assert_eq!(canonical(&recovered.repo), canonical(&wt), "the switched worktree");
+        assert_eq!(canonical(&recovered.opened_in), canonical(dir.path()));
     }
 }

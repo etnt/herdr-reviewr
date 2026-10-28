@@ -478,3 +478,44 @@ fn a_send_without_a_socket_refuses_as_herdr_not_answering() {
     assert_eq!(app.status, "herdr didn't answer, press y to copy");
     assert_eq!(app.store.len(), 1, "a refusal keeps every comment");
 }
+
+/// One agent, idle in `cwd`, as `herdr agent list` reports it.
+fn agent_at(cwd: &Path) -> String {
+    let cwd = serde_json::to_string(&cwd.to_string_lossy()).unwrap();
+    format!(
+        r#"{{"result":{{"agents":[{{"agent":"claude","agent_status":"idle","pane_id":"w8:p1","tab_id":"w8:t1","workspace_id":"w8","cwd":{cwd}}}]}}}}"#
+    )
+}
+
+/// A review names its worktree exactly when the agent works in another one.
+#[test]
+fn a_review_to_an_agent_in_another_worktree_names_this_one() {
+    if !in_child() {
+        let dir = run_in_child("a_review_to_an_agent_in_another_worktree_names_this_one", true);
+        assert!(herdr_calls(dir.path()).contains("agent focus"), "the child delivered no send");
+        return;
+    }
+
+    let socket = FakeSocket::serve(&socket_path());
+    let (repo, mut app) = app();
+    let elsewhere = repo.add_worktree("company-pages");
+    let keymap = Keymap::default();
+    let area = Rect::new(0, 0, 80, 24);
+    let line = serde_json::to_string(&format!("Worktree: {}", app.repo.display())).unwrap();
+    let line = line.trim_matches('"');
+
+    agents(&fixture_dir(), &agent_at(elsewhere.path()));
+    write_comment(&mut app, "naming");
+    press(&mut app, KeyCode::Char('s'), area, &keymap);
+    assert!(app.store.is_empty(), "{}", app.status);
+    let sent = socket.requests().last().cloned().unwrap();
+    assert!(sent.contains(&format!(r#""text":"\u001b[200~{line}{NL}{NL}a.rs:2"#)), "{sent}");
+
+    // An agent in this worktree, at a subdirectory, gets today's review byte for byte.
+    std::fs::create_dir_all(repo.path().join("sub")).unwrap();
+    agents(&fixture_dir(), &agent_at(&repo.path().join("sub")));
+    write_comment(&mut app, "naming");
+    press(&mut app, KeyCode::Char('s'), area, &keymap);
+    let sent = socket.requests().last().cloned().unwrap();
+    assert!(sent.contains(&format!(r#""text":"\u001b[200~a.rs:2{NL}+beta{NL}naming"#)), "{sent}");
+}

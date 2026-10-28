@@ -5,8 +5,8 @@ mod common;
 use std::cell::RefCell;
 use std::path::Path;
 
-use anyhow::{Result, bail};
-use common::{Repo, UnifiedRow as _, app_on, app_on_rendered, enter_tab, typed};
+use anyhow::Result;
+use common::{FakeTarget, Repo, UnifiedRow as _, app_on, app_on_rendered, enter_tab, typed};
 use herdr_reviewr::app::{App, Band, Focus, FooterAction, Mode};
 use herdr_reviewr::config::NavigatorPosition;
 use herdr_reviewr::diff::{Bar, MarkerKind, RenderedKind, Row};
@@ -21,41 +21,6 @@ use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Rect;
-
-/// An export target that records what it was handed and can be made to fail.
-struct FakeTarget {
-    ok: bool,
-    captured: RefCell<Vec<String>>,
-}
-
-impl FakeTarget {
-    fn ok() -> Self {
-        Self { ok: true, captured: RefCell::new(Vec::new()) }
-    }
-    fn failing() -> Self {
-        Self { ok: false, captured: RefCell::new(Vec::new()) }
-    }
-    fn last(&self) -> String {
-        self.captured.borrow().last().cloned().unwrap_or_default()
-    }
-}
-
-impl ExportTarget for FakeTarget {
-    fn label(&self) -> &'static str {
-        "fake"
-    }
-    fn success_message(&self, count: usize) -> String {
-        let noun = if count == 1 { "comment" } else { "comments" };
-        format!("exported {count} {noun}")
-    }
-    fn failure_message(&self, _error: &anyhow::Error, _copy: &str) -> String {
-        "fake not found".to_string()
-    }
-    fn export(&self, text: &str) -> Result<()> {
-        self.captured.borrow_mut().push(text.to_string());
-        if self.ok { Ok(()) } else { bail!("fake export failure") }
-    }
-}
 
 /// A repo whose single tracked file `a.rs` has an edit and an appended line.
 fn edited_repo() -> Repo {
@@ -2575,7 +2540,7 @@ fn jump_moves_the_cursor_onto_a_commented_line() {
 
 /// One agent working in `cwd`, as `herdr agent list` would report it.
 fn agent_in(cwd: &Path, status: Status) -> AgentSample {
-    AgentSample { cwd: Some(cwd.to_string_lossy().into_owned()), status }
+    AgentSample { cwd: Some(cwd.to_string_lossy().into_owned()), workspace: String::new(), status }
 }
 
 /// The members among `samples` folded into turn tracking, as the herdr connection does.
@@ -2585,9 +2550,9 @@ fn observed(
 ) -> herdr_reviewr::turn::TurnReport {
     let statuses = samples.and_then(|samples| {
         let names: Vec<String> = (0..samples.len()).map(|i| i.to_string()).collect();
-        let panes: Vec<(&str, Option<&str>)> =
-            names.iter().zip(samples).map(|(n, s)| (n.as_str(), s.cwd.as_deref())).collect();
-        let members = host.members(&panes)?;
+        let panes: Vec<(&str, &AgentSample)> =
+            names.iter().zip(samples).map(|(n, s)| (n.as_str(), s)).collect();
+        let members = host.members(&panes, &[], None)?;
         Some(
             members.iter().map(|m| samples[m.parse::<usize>().unwrap()].status).collect::<Vec<_>>(),
         )
@@ -2859,7 +2824,11 @@ fn an_agent_whose_cwd_is_not_an_absolute_path_is_not_a_member() {
     r.write("a.rs", "one\n");
     r.commit_all("init");
     let (mut app, mut host) = turn_setup(&r);
-    let nowhere = |cwd: &str| AgentSample { cwd: Some(cwd.to_string()), status: Status::Working };
+    let nowhere = |cwd: &str| AgentSample {
+        cwd: Some(cwd.to_string()),
+        workspace: String::new(),
+        status: Status::Working,
+    };
 
     observe_agents(&mut app, &mut host, Some(&[nowhere(""), nowhere("sub")]));
     assert_eq!(app.agents_present(), Some(false), "neither spelling names a worktree");
@@ -5742,7 +5711,13 @@ mod search_overlay {
 // --- Agent picker ------------------------------------
 
 fn choice(pane: &str, name: &str) -> AgentChoice {
-    AgentChoice { pane_id: pane.into(), name: name.into(), state: "idle".into(), tab: "1".into() }
+    AgentChoice {
+        pane_id: pane.into(),
+        name: name.into(),
+        state: "idle".into(),
+        tab: "1".into(),
+        cwd: None,
+    }
 }
 
 fn three_agents() -> Vec<AgentChoice> {
@@ -6442,7 +6417,7 @@ fn the_base_picker_owns_the_whole_footer_bar_and_survives_a_config_error() {
     let bands: Vec<FooterAction> = app.footer_bands().into_iter().map(|(a, _)| a).collect();
     assert_eq!(
         bands,
-        vec![FooterAction::PickBaseRow, FooterAction::ClosePicker, FooterAction::MoveBaseRow]
+        vec![FooterAction::PickBaseRow, FooterAction::ClosePicker, FooterAction::MoveMenuRow]
     );
 
     // The config error leaves the picker open for recovery to carry.
@@ -8020,7 +7995,7 @@ fn a_commit_comment_renders_only_while_the_scope_reads_that_commit() {
     // The list and the export carry both, unchanged.
     assert_eq!(app.store.len(), 2);
     let all: Vec<&herdr_reviewr::model::Comment> = app.store.iter().collect();
-    let text = herdr_reviewr::export::format_review(None, &all);
+    let text = herdr_reviewr::export::format_review(None, None, &all);
     assert!(text.contains("worktree note") && text.contains("commit note"));
 }
 
@@ -8414,7 +8389,7 @@ fn a_rendered_comment_equals_the_source_comment() {
     app.start_comment();
     write_comment(&mut app, "tighten this");
     let rendered = app.store.get(0).unwrap().clone();
-    let rendered_export = herdr_reviewr::export::format_review(None, &[&rendered]);
+    let rendered_export = herdr_reviewr::export::format_review(None, None, &[&rendered]);
     assert_eq!((rendered.side, rendered.start, rendered.end), (Side::New, 3, 4));
     assert_eq!(
         rendered.lines, " alpha one\n-beta two\n+BETA TWO",
@@ -8432,7 +8407,7 @@ fn a_rendered_comment_equals_the_source_comment() {
     write_comment(&mut app, "tighten this");
     let source = app.store.get(0).unwrap().clone();
     assert_eq!(source, rendered, "same side, range, snippet, kind, and rev");
-    assert_eq!(herdr_reviewr::export::format_review(None, &[&source]), rendered_export);
+    assert_eq!(herdr_reviewr::export::format_review(None, None, &[&source]), rendered_export);
 
     // Two rendered blocks anchor lines 1..=4, the blank between included.
     app.store.take(0);
@@ -8445,7 +8420,7 @@ fn a_rendered_comment_equals_the_source_comment() {
     let rendered = app.store.take(0).unwrap();
     assert_eq!((rendered.side, rendered.start, rendered.end), (Side::New, 1, 4));
     assert_eq!(rendered.lines, " # Title\n \n alpha one\n-beta two\n+BETA TWO");
-    let rendered_export = herdr_reviewr::export::format_review(None, &[&rendered]);
+    let rendered_export = herdr_reviewr::export::format_review(None, None, &[&rendered]);
 
     app.toggle_rendered();
     app.diff_cursor = app.visible.iter().position(|r| r.new_no() == Some(1)).unwrap();
@@ -8455,7 +8430,7 @@ fn a_rendered_comment_equals_the_source_comment() {
     write_comment(&mut app, "both");
     let source = app.store.get(0).unwrap();
     assert_eq!(*source, rendered, "a multi-block range equals the contiguous source range");
-    assert_eq!(herdr_reviewr::export::format_review(None, &[source]), rendered_export);
+    assert_eq!(herdr_reviewr::export::format_review(None, None, &[source]), rendered_export);
 }
 
 /// Comment the first `-` row in source, then return its card's rendered row.
@@ -9013,7 +8988,7 @@ fn a_removed_marker_comment_anchors_the_deleted_lines_on_the_old_side() {
     assert_eq!(c.side, Side::Old);
     assert!(c.lines.contains("-gone para"), "{:?}", c.lines);
     assert!(!c.lines.contains("keep"), "a marker stands for its own lines alone");
-    let out = herdr_reviewr::export::format_review(None, &[&c]);
+    let out = herdr_reviewr::export::format_review(None, None, &[&c]);
     assert!(out.contains("(removed)"), "{out}");
     // Its card sits under the marker.
     assert_eq!(app.card_rows(), vec![(marker, 0)]);
@@ -9900,7 +9875,7 @@ fn the_diff_agrees_with_git_diff_under_any_line_ending_rule() {
         typed(&mut app, "why?");
         app.submit_comment();
         let all: Vec<&herdr_reviewr::model::Comment> = app.store.iter().collect();
-        let export = herdr_reviewr::export::format_review(None, &all);
+        let export = herdr_reviewr::export::format_review(None, None, &all);
         assert!(export.contains(&lines[1]) && !export.contains('\r'), "{case}: {export:?}");
 
         app.open_search();
@@ -9959,7 +9934,7 @@ fn an_untracked_or_renamed_crlf_file_reads_like_git() {
     typed(&mut app, "why?");
     app.submit_comment();
     let all: Vec<&herdr_reviewr::model::Comment> = app.store.iter().collect();
-    assert!(!herdr_reviewr::export::format_review(None, &all).contains('\r'));
+    assert!(!herdr_reviewr::export::format_review(None, None, &all).contains('\r'));
     app.select_file(file_row_of(&app, "moved.txt").expect("moved.txt listed")).unwrap();
     assert!(change_rows(&app).is_empty(), "{:?}", change_rows(&app));
 }

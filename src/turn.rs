@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::git;
+use crate::herdr::AgentSample;
 
 /// An agent's status as herdr reports it (`agent_status`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -198,10 +199,14 @@ pub struct TurnHost {
     tracker: TurnTracker,
     last: LastTurn,
     repo: PathBuf,
-    /// The reviewed worktree's [`canonical`] root, which a member's top level equals.
+    /// The reviewed worktree's [`git::canonical`] root, which a member's top level equals.
     root: PathBuf,
     /// Each agent `cwd` with a resolved top level, mapped to whether it is a member.
     resolved: HashMap<String, bool>,
+    /// This clone's git common dir, read the first time the fallback asks.
+    common: Option<PathBuf>,
+    /// Each agent `cwd` git answered for, mapped to whether it is in this clone.
+    clones: HashMap<String, bool>,
     turn: Option<TurnWindow>,
     /// When the last write arrived, so a turn whose status edge follows its first write sees it.
     last_write: Option<Instant>,
@@ -230,11 +235,6 @@ fn worktree_cwd(cwd: Option<&str>) -> Option<&str> {
     cwd.filter(|c| Path::new(c).is_absolute())
 }
 
-/// `path` as the OS resolves it, so two spellings of one directory compare equal.
-fn canonical(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
 impl TurnHost {
     /// Resume the persisted baseline of `repo`, which must be the git top level.
     pub fn open(repo: PathBuf) -> Self {
@@ -242,9 +242,11 @@ impl TurnHost {
         Self {
             tracker: TurnTracker::default(),
             last,
-            root: canonical(&repo),
+            root: git::canonical(&repo),
+            common: None,
             repo,
             resolved: HashMap::new(),
+            clones: HashMap::new(),
             turn: None,
             last_write: None,
             watcher_down: false,
@@ -255,12 +257,34 @@ impl TurnHost {
         self.last.tree()
     }
 
-    /// The panes among `agents` (pane, cwd) working in this worktree, or `None` while any one's
-    /// place is undetermined.
-    pub fn members<'a>(&mut self, agents: &[(&'a str, Option<&str>)]) -> Option<Vec<&'a str>> {
+    /// This worktree's agents, else `workspace`'s in this clone; `None` while an unread one may be.
+    pub fn members<'a>(
+        &mut self,
+        agents: &[(&'a str, &AgentSample)],
+        // The cwds of entries herdr shaped unexpectedly, which may be agents.
+        odd: &[Option<String>],
+        workspace: Option<&str>,
+    ) -> Option<Vec<&'a str>> {
         let mut members = Vec::new();
-        for &(pane, cwd) in agents {
-            match self.membership(cwd) {
+        let cwds = agents.iter().map(|(pane, a)| (Some(*pane), a.cwd.as_deref()));
+        for (pane, cwd) in cwds.chain(odd.iter().map(|cwd| (None, cwd.as_deref()))) {
+            match (self.membership(cwd), pane) {
+                (Membership::Member, Some(pane)) => members.push(pane),
+                (Membership::NotMember, _) => {}
+                (Membership::Member | Membership::Unknown, _) => return None,
+            }
+        }
+        let Some(workspace) = workspace.filter(|_| members.is_empty()) else {
+            return Some(members);
+        };
+        // An odd entry names no workspace, so one in this clone may be a member.
+        for cwd in odd {
+            if !matches!(self.clone_membership(cwd.as_deref()), Membership::NotMember) {
+                return None;
+            }
+        }
+        for &(pane, agent) in agents.iter().filter(|(_, a)| a.workspace == workspace) {
+            match self.clone_membership(agent.cwd.as_deref()) {
                 Membership::Member => members.push(pane),
                 Membership::NotMember => {}
                 Membership::Unknown => return None,
@@ -269,10 +293,28 @@ impl TurnHost {
         Some(members)
     }
 
-    /// Whether any agent at `cwds` may work in this worktree: a member, or one whose place is
-    /// undetermined.
-    pub fn may_include(&mut self, cwds: &[Option<String>]) -> bool {
-        cwds.iter().any(|cwd| !matches!(self.membership(cwd.as_deref()), Membership::NotMember))
+    /// Whether `cwd` sits in a worktree of this clone, by git common dir.
+    fn clone_membership(&mut self, cwd: Option<&str>) -> Membership {
+        let Some(cwd) = worktree_cwd(cwd) else { return Membership::NotMember };
+        if let Some(&same) = self.clones.get(cwd) {
+            return if same { Membership::Member } else { Membership::NotMember };
+        }
+        if self.common.is_none() {
+            self.common = git::git_dirs(&self.repo).map(|(_, common)| common);
+        }
+        let Some(common) = self.common.clone() else { return Membership::Unknown };
+        match git::common_dir_of(Path::new(cwd)) {
+            git::Worktree::Root(theirs) => {
+                let same = theirs == common;
+                self.clones.insert(cwd.to_string(), same);
+                if same { Membership::Member } else { Membership::NotMember }
+            }
+            git::Worktree::Outside => {
+                self.clones.insert(cwd.to_string(), false);
+                Membership::NotMember
+            }
+            git::Worktree::Unknown => Membership::Unknown,
+        }
     }
 
     /// Advance from the members' statuses as herdr reported them `at`; `None`, an unknown set,
@@ -397,13 +439,13 @@ impl TurnHost {
             return if member { Membership::Member } else { Membership::NotMember };
         }
         // A member's top level is this root, so a cwd outside it is none, with no git to ask.
-        if !canonical(Path::new(cwd)).starts_with(&self.root) {
+        if !git::canonical(Path::new(cwd)).starts_with(&self.root) {
             return Membership::NotMember;
         }
         match git::worktree_of(Path::new(cwd)) {
             // A resolved root never moves, so it is cached.
             git::Worktree::Root(top) => {
-                let member = canonical(&top) == self.root;
+                let member = git::canonical(&top) == self.root;
                 self.resolved.insert(cwd.to_string(), member);
                 if member { Membership::Member } else { Membership::NotMember }
             }
@@ -477,9 +519,18 @@ mod tests {
         let elsewhere = tempfile::tempdir().unwrap();
         let mut host = super::TurnHost::open(root);
         let before = crate::git::GIT_COMMANDS.with(std::cell::Cell::get);
-        let cwd = elsewhere.path().to_string_lossy().into_owned();
-        assert_eq!(host.members(&[("w:1", Some(cwd.as_str()))]), Some(vec![]));
+        let agent = seat(elsewhere.path().to_str(), "w");
+        assert_eq!(host.members(&[("w:1", &agent)], &[], None), Some(vec![]));
         assert_eq!(crate::git::GIT_COMMANDS.with(std::cell::Cell::get), before, "no git asked");
+    }
+
+    /// An idle agent at `cwd` in workspace `ws`.
+    fn seat(cwd: Option<&str>, ws: &str) -> crate::herdr::AgentSample {
+        crate::herdr::AgentSample {
+            cwd: cwd.map(str::to_string),
+            workspace: ws.to_string(),
+            status: super::Status::Idle,
+        }
     }
 
     #[test]
@@ -514,10 +565,52 @@ mod tests {
         };
         let outside = tempfile::tempdir().unwrap();
         let mut host = super::TurnHost::open(root.clone());
-        let mine = root.to_string_lossy().into_owned();
-        let theirs = outside.path().to_string_lossy().into_owned();
-        let agents = [("w:1", Some(mine.as_str())), ("w:2", Some(theirs.as_str())), ("w:3", None)];
-        assert_eq!(host.members(&agents), Some(vec!["w:1"]));
+        let (mine, theirs, nowhere) =
+            (seat(root.to_str(), "w"), seat(outside.path().to_str(), "w"), seat(None, "w"));
+        let agents = [("w:1", &mine), ("w:2", &theirs), ("w:3", &nowhere)];
+        assert_eq!(host.members(&agents, &[], Some("w")), Some(vec!["w:1"]));
+    }
+
+    #[test]
+    fn with_no_agent_here_the_workspaces_agents_in_this_clone_are_members() {
+        let (dir, git) = crate::test_support::test_repo();
+        let sibling = tempfile::tempdir().unwrap();
+        let linked = sibling.path().join("linked");
+        git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+        git(&["worktree", "add", "-q", "-b", "linked", &linked.to_string_lossy()]);
+        let other_clone = crate::test_support::test_repo().0;
+        let mut host = super::TurnHost::open(linked.canonicalize().unwrap());
+        let no_repo = tempfile::tempdir().unwrap();
+        let main = dir.path().to_str();
+        let seats = [
+            seat(main, "w"),
+            seat(main, "elsewhere"),
+            seat(other_clone.path().to_str(), "w"),
+            seat(main, ""),
+            seat(no_repo.path().to_str(), "w"),
+        ];
+        let agents = [
+            ("w:1", &seats[0]),
+            ("w:2", &seats[1]),
+            ("w:3", &seats[2]),
+            ("w:4", &seats[3]),
+            ("w:5", &seats[4]),
+        ];
+        let members = host.members(&agents, &[], Some("w"));
+        assert_eq!(members, Some(vec!["w:1"]), "this clone, this workspace");
+        assert_eq!(host.members(&agents, &[], None), Some(vec![]), "no workspace, no fallback");
+
+        // Every answer is cached, a cwd outside any repository too.
+        let before = crate::git::GIT_COMMANDS.with(std::cell::Cell::get);
+        host.members(&agents, &[], Some("w"));
+        assert_eq!(crate::git::GIT_COMMANDS.with(std::cell::Cell::get), before, "no git asked");
+
+        // An entry herdr shaped unexpectedly in this clone may be a member: hold.
+        assert_eq!(host.members(&agents, &[main.map(str::to_string)], Some("w")), None);
+
+        // An agent here outranks the fallback.
+        let here = seat(linked.to_str(), "elsewhere");
+        assert_eq!(host.members(&[agents[0], ("w:6", &here)], &[], Some("w")), Some(vec!["w:6"]));
     }
 
     #[test]

@@ -6,6 +6,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Worktree switch**: `W` lists this repo's worktrees, and a pick reviews that one in the same pane until it closes. A review sent to an agent working in another worktree names this one.
+  Thanks [@cajames](https://github.com/cajames) ([#152](https://github.com/persiyanov/herdr-reviewr/pull/152)) and [@jmoreno-blr](https://github.com/jmoreno-blr) ([#115](https://github.com/persiyanov/herdr-reviewr/issues/115)).
+- **Breaking: `W` is a new default key.** A `[keybindings]` config that already uses `W` now collides and must move it.
+
 ## [0.48.0] — 2026-10-19
 
 ### Added
