@@ -13,6 +13,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 - **Every review names its worktree**: a send or copy carries `Worktree: <path>` after `review_prefix`, ahead of the comments.
+- **Footer**: the worktree on screen, as `folder · branch`, closes the row at the right, and `?` moves to the left.
+
+### Fixed
+- **A branch that shares a tag's name** reads as itself, not `heads/<name>`, in the PR tab and the base picker.
+- **Emoji in the footer** count by their columns, so a long status no longer runs past the edge.
 
 ## [0.48.0] — 2026-10-19
 

@@ -170,6 +170,7 @@ fn path_limited_equals_full(scope: Scope, tab: Tab) {
         let ends = |s: &WorldSnapshot| s.changeset.ends.clone();
         assert_eq!(ends(&scoped), ends(&full), "{scope:?}/{tab:?} {name}: the ends");
         assert_eq!(scoped.entries, full.entries, "{scope:?}/{tab:?} {name}: the navigator");
+        assert_eq!(scoped.checkout.as_deref(), Some("feature"), "{scope:?}/{tab:?} {name}");
         let batch: BTreeSet<String> = batch.iter().map(|p| (*p).to_string()).collect();
         let touched = scoped.touched.unwrap_or_else(|| panic!("{scope:?}/{tab:?} {name}: by path"));
         assert!(touched.is_superset(&batch), "{scope:?}/{tab:?} {name}: re-read {touched:?}");
@@ -209,6 +210,58 @@ fn last_turn_all_files_tab() {
 #[test]
 fn commits_changes_tab() {
     path_limited_equals_full(Scope::Commits, Tab::Changes);
+}
+
+#[test]
+fn a_full_build_names_what_the_worktree_has_checked_out() {
+    let r = fixture();
+    let mut worker = Worker::on(&r);
+    let input = input_for(&r, Scope::Uncommitted, Tab::Changes);
+    let checkout = |worker: &mut Worker| worker.run(&input, Refresh::Full).1.unwrap().checkout;
+    assert_eq!(checkout(&mut worker).as_deref(), Some("feature"));
+    r.git(&["checkout", "-q", "main"]);
+    assert_eq!(checkout(&mut worker).as_deref(), Some("main"), "a checkout");
+    r.git(&["checkout", "-q", "--detach"]);
+    let head = r.git(&["rev-parse", "--short=7", "HEAD"]).trim().to_string();
+    assert_eq!(checkout(&mut worker), Some(format!("detached {head}")), "a detached HEAD");
+}
+
+#[test]
+fn the_pr_tab_reads_only_the_checkout_and_leaves_the_file_tabs_frozen() {
+    let r = fixture();
+    let root = herdr_reviewr::git::toplevel(r.path()).unwrap();
+    let mut app = App::new(root.clone(), Scope::Uncommitted, Some("main".into()));
+    app.reload().unwrap();
+    app.set_tab(Tab::Pr).unwrap();
+    let frozen = app.entries.clone();
+    r.git(&["checkout", "-q", "-b", "other"]);
+    r.write("new.txt", "x\n");
+
+    let mut worker = Worker::on(&r);
+    let (_, read) = worker.run(&app.world_input(), paths(&["new.txt"]));
+    assert!(read.is_none(), "a worktree batch reads nothing on the PR tab");
+    let (_, read) = worker.run(&app.world_input(), Refresh::Full);
+    app.reconcile_world(read.expect("a full refresh reads the checkout"));
+    assert_eq!(app.worktree_name().1, Some("other"), "the footer follows the checkout");
+    assert_eq!(app.entries, frozen, "the file tabs stay frozen");
+
+    // A pane that opens or switches onto the PR tab names its checkout too.
+    let mut opened = App::new(root, Scope::Uncommitted, Some("main".into()));
+    opened.set_tab(Tab::Pr).unwrap();
+    opened.reload().unwrap();
+    assert_eq!(opened.worktree_name().1, Some("other"));
+}
+
+#[test]
+fn a_worktree_that_stops_being_a_repo_names_no_checkout() {
+    let r = fixture();
+    let root = herdr_reviewr::git::toplevel(r.path()).unwrap();
+    let mut app = App::new(root, Scope::Uncommitted, Some("main".into()));
+    app.reload().unwrap();
+    assert_eq!(app.worktree_name().1, Some("feature"));
+    std::fs::remove_dir_all(r.path().join(".git")).unwrap();
+    app.reload().unwrap();
+    assert_eq!(app.worktree_name().1, None, "nothing is checked out outside a repo");
 }
 
 #[test]

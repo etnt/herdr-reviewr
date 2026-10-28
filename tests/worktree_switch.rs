@@ -59,9 +59,9 @@ fn switch_target(app: &App) -> Option<std::path::PathBuf> {
 }
 
 /// The pane restarted on `path`, loaded as the run loop loads it.
-fn switch_to(old: &mut App, path: &std::path::Path, name: &str) -> App {
+fn switch_to(old: &mut App, path: &std::path::Path) -> App {
     let cfg = Config::parse([path.to_string_lossy().into_owned()]);
-    let mut switched = switched_app(&cfg, old, name);
+    let mut switched = switched_app(&cfg, old);
     switched.reload().unwrap();
     switched
 }
@@ -72,13 +72,15 @@ fn row_names(app: &App) -> Vec<String> {
 }
 
 #[test]
-fn the_picker_lists_the_current_first_then_by_branch_and_filters() {
+fn the_picker_lists_the_current_then_home_then_by_branch_and_filters() {
     let (repo, _zeta, pages) = clone_with_worktrees();
+    // A branch that sorts before home, so only the home rule puts home second.
+    let _alpha = repo.add_worktree("alpha");
     let mut app = app_on(&repo);
     press(&mut app, KeyCode::Char('W'));
     assert_eq!(app.mode, Mode::WorktreePick);
     let current = herdr_reviewr::git::checked_out_branch(repo.path()).unwrap().unwrap();
-    assert_eq!(row_names(&app), [current.as_str(), "company-pages", "zeta"]);
+    assert_eq!(row_names(&app), [current.as_str(), "alpha", "company-pages", "zeta"]);
     let wp = app.worktree_picker.as_ref().unwrap();
     assert!(wp.rows[0].current && wp.cursor == 0, "the cursor starts on the current worktree");
 
@@ -87,6 +89,7 @@ fn the_picker_lists_the_current_first_then_by_branch_and_filters() {
     assert_eq!((app.mode.clone(), app.switch_to.clone()), (Mode::Normal, None));
 
     press(&mut app, KeyCode::Char('W'));
+    press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Down);
     type_text(&mut app, "comp");
@@ -100,6 +103,14 @@ fn the_picker_lists_the_current_first_then_by_branch_and_filters() {
         "no comments: the pick switches"
     );
     assert_eq!(app.mode, Mode::Normal);
+
+    // Switched, the pick leads and home, where the pane opened, follows it.
+    let mut switched = switch_to(&mut app, pages.path());
+    press(&mut switched, KeyCode::Char('W'));
+    assert_eq!(row_names(&switched), ["company-pages", current.as_str(), "alpha", "zeta"]);
+    let wp = switched.worktree_picker.as_ref().unwrap();
+    assert!(wp.rows[1].home && !wp.rows[1].current, "home is marked, under the current");
+    assert_eq!(wp.cursor, 0, "the cursor still starts on the current worktree");
 }
 
 #[test]
@@ -222,7 +233,7 @@ fn a_switch_reviews_the_pick_and_keeps_only_the_view() {
     old.herdr.ids.pane = Some("w9:p3".into());
     old.herdr.ids.workspace = Some("w9".into());
 
-    let switched = switch_to(&mut old, wt.path(), "company-pages");
+    let switched = switch_to(&mut old, wt.path());
 
     let mut fresh = herdr_reviewr::app::App::new(switched.repo.clone(), Scope::Branch, None);
     fresh.reload().unwrap();
@@ -237,7 +248,10 @@ fn a_switch_reviews_the_pick_and_keeps_only_the_view() {
         "the live pane id, not the env's"
     );
     assert_eq!(switched.herdr.ids.workspace.as_deref(), Some("w9"));
-    assert_eq!(switched.status, "reviewing company-pages until this pane closes");
+    assert_eq!(switched.status, "", "the footer names the pick, so the switch says nothing");
+    let named = ("wt".to_string(), Some("company-pages"));
+    assert_eq!(switched.worktree_name(), named, "the pick's folder and branch");
+    assert_eq!(canonical(&switched.home), canonical(repo.path()), "where the pane opened");
 }
 
 #[test]
@@ -257,7 +271,7 @@ fn a_review_names_the_worktree_on_screen_before_and_after_a_switch() {
     assert!(old.export(&copied));
     assert_eq!(copied.last(), review(repo.path()));
 
-    let mut switched = switch_to(&mut old, wt.path(), "company-pages");
+    let mut switched = switch_to(&mut old, wt.path());
     assert_eq!(canonical(&switched.repo), canonical(wt.path()), "the pick, not where it opened");
     switched.store.add(comment());
     assert!(switched.export(&copied));
@@ -279,7 +293,7 @@ fn every_view_of_a_switched_pane_matches_a_pane_opened_there() {
     for scope in [Scope::Uncommitted, Scope::Branch] {
         let mut old = app_on(&repo);
         old.set_scope(scope).unwrap();
-        let mut switched = switch_to(&mut old, wt.path(), "company-pages");
+        let mut switched = switch_to(&mut old, wt.path());
         let mut fresh = App::new(switched.repo.clone(), scope, None);
         fresh.reload().unwrap();
         assert_eq!(paths(&switched), paths(&fresh), "{scope:?}");
@@ -298,6 +312,6 @@ fn a_commit_pick_scope_stays_behind() {
     let wt = repo.add_worktree("other");
     let mut old = app_on(&repo);
     old.scope = Scope::Commits;
-    let switched = switch_to(&mut old, wt.path(), "other");
+    let switched = switch_to(&mut old, wt.path());
     assert_eq!(switched.scope, Scope::Uncommitted, "the default scope, not the old pick's");
 }

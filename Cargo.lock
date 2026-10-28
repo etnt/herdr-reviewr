@@ -985,6 +985,7 @@ dependencies = [
  "time",
  "toml",
  "two-face",
+ "unicode-truncate",
  "unicode-width",
  "which",
  "windows-sys 0.61.2",

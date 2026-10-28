@@ -80,7 +80,7 @@ herdr-reviewr ~/some/repo
 4. **Comment.** `c`, type, `Enter`.
 5. **Send.** `s` puts every comment in the agent's input.
 
-The footer shows the next step. `?` lists every key.
+The footer shows the next step, and the worktree you're on at its right. `?` lists every key.
 
 To toggle reviewr with a key, add this to `~/.config/herdr/config.toml`:
 

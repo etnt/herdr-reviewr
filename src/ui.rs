@@ -11,6 +11,7 @@ use ratatui::widgets::{
     Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
     ScrollbarState,
 };
+use unicode_truncate::UnicodeTruncateStr;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, Band, Focus, FooterAction, Mode, Tab};
@@ -1695,21 +1696,16 @@ fn elide_head(name: &str, max: usize) -> String {
     if name.width() <= max {
         return name.to_string();
     }
-    let budget = max.saturating_sub(1); // a column for the `…`
-    let mut tail = String::new();
-    let mut w = 0;
-    for ch in name.chars().rev() {
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if w + cw > budget {
-            break;
-        }
-        tail.insert(0, ch);
-        w += cw;
+    let (tail, _) = name.unicode_truncate_start(max.saturating_sub(1)); // a column for the `…`
+    format!("…{}", tail.find('/').map_or(tail, |slash| &tail[slash..]))
+}
+
+/// Elide `name`'s head to `max` columns, cutting anywhere.
+fn cut_head(name: &str, max: usize) -> String {
+    if name.width() <= max {
+        return name.to_string();
     }
-    if let Some(slash) = tail.find('/') {
-        tail = tail[slash..].to_string();
-    }
-    format!("…{tail}")
+    format!("…{}", name.unicode_truncate_start(max.saturating_sub(1)).0)
 }
 
 /// A saved comment's inline card: a box titled with its location, holding its text.
@@ -1757,18 +1753,7 @@ fn truncate_width(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
     }
-    let mut out = String::new();
-    let mut w = 0;
-    for ch in s.chars() {
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if w + cw > max.saturating_sub(1) {
-            break;
-        }
-        out.push(ch);
-        w += cw;
-    }
-    out.push('…');
-    out
+    format!("{}…", s.unicode_truncate(max - 1).0)
 }
 
 /// The visible stand-in for a line-ending CR: its caret notation, as `less` and vim show it.
@@ -2672,6 +2657,66 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_worktree_name_gives_way_from_the_folder_then_the_branch_stands_alone() {
+        let branch = Some("worktree/lucky-meadow-02ec");
+        let rows = [
+            (
+                "whole",
+                "herdr-reviewr",
+                branch,
+                99,
+                Some("herdr-reviewr · worktree/lucky-meadow-02ec"),
+            ),
+            (
+                "the folder cut",
+                "herdr-reviewr",
+                branch,
+                37,
+                Some("…reviewr · worktree/lucky-meadow-02ec"),
+            ),
+            (
+                "one folder column",
+                "herdr-reviewr",
+                branch,
+                31,
+                Some("…r · worktree/lucky-meadow-02ec"),
+            ),
+            (
+                "the folder's `…`",
+                "herdr-reviewr",
+                branch,
+                30,
+                Some("… · worktree/lucky-meadow-02ec"),
+            ),
+            ("the branch alone", "herdr-reviewr", branch, 29, Some("worktree/lucky-meadow-02ec")),
+            ("the branch cut", "herdr-reviewr", branch, 20, Some("…e/lucky-meadow-02ec")),
+            ("a short branch", "herdr-reviewr", Some("main"), 4, Some("main")),
+            ("wide characters", "機能", Some("ブランチ"), 14, Some("…能 · ブランチ")),
+            ("unread: the folder", "herdr-reviewr", None, 99, Some("herdr-reviewr")),
+            ("unread, cut", "herdr-reviewr", None, 8, Some("…reviewr")),
+            ("below the minimum", "herdr-reviewr", None, 5, None),
+            ("a short name whole", "wt", Some("x"), 6, Some("wt · x")),
+            ("nothing to name", "", None, 99, None),
+        ];
+        for (name, folder, checkout, room, expected) in rows {
+            let fitted = fit_worktree(folder, checkout, room);
+            assert_eq!(fitted.as_deref(), expected, "{name}");
+            assert!(fitted.is_none_or(|f| f.width() <= room), "{name}: within its room");
+        }
+    }
+
+    #[test]
+    fn a_cut_through_arabic_ligatures_never_panics() {
+        // `unicode-width` 0.2 counts lam-alef as one column across two graphemes.
+        let text = "لا".repeat(20);
+        for max in 1..12 {
+            for cut in [truncate_width(&text, max), cut_head(&text, max), elide_head(&text, max)] {
+                assert!(cut.width() <= max, "{cut:?} within {max}");
+            }
+        }
+    }
+
+    #[test]
     fn a_stamp_ahead_of_this_clock_reads_now_until_a_second_past_it() {
         let then = crate::forge::parse_iso("2026-06-27T12:00:00Z").unwrap() as u64;
         let now = UNIX_EPOCH + std::time::Duration::from_secs(then - 30);
@@ -2942,16 +2987,12 @@ fn action_entry(app: &App, action: FooterAction, band: Band) -> Vec<Span<'static
 /// The rendered width of one action entry: its `key label` (a space joins them).
 fn entry_body_width(app: &App, action: FooterAction) -> usize {
     let (key, label) = action_key_label(app, action);
-    if label.is_empty() {
-        key.chars().count()
-    } else {
-        key.chars().count() + 1 + label.chars().count()
-    }
+    if label.is_empty() { key.width() } else { key.width() + 1 + label.width() }
 }
 
 /// The rendered width of one action entry, plus its leading ` · ` separator.
 fn entry_width(app: &App, action: FooterAction) -> usize {
-    SEP.chars().count() + entry_body_width(app, action)
+    SEP.width() + entry_body_width(app, action)
 }
 
 /// The ` · ` that joins footer entries, and the dim-label indent of a wrapped `?`-band row.
@@ -2962,8 +3003,14 @@ const BAND_INDENT: usize = 6;
 const STATUS_FRAME: usize = 5;
 /// The narrowest status row 1 paints; below it the status drops.
 const STATUS_MIN: usize = 8;
-/// The ` …` a trimmed modal footer ends with, in place of `?`.
+/// The ` …` a trimmed modal footer ends with.
 const MORE_ELLIPSIS: usize = 2;
+/// The `?` and its space before a band label, which the bands below indent past.
+const MORE_GUTTER: usize = 2;
+/// The worktree name's frame at the right: a two-space gap and a trailing space.
+const WORKTREE_FRAME: usize = 3;
+/// The narrowest cut of the worktree name row 1 paints; below it the name drops.
+const WORKTREE_MIN: usize = 6;
 
 /// The footer: row 1, plus the `?` bands when open.
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
@@ -3009,66 +3056,83 @@ fn footer_row1(app: &App, w: usize) -> (Vec<Span<'static>>, Vec<FooterAction>) {
         bands.iter().filter(|&&(_, b)| b == Band::Do).map(|&(a, _)| a).collect();
     let send = bands.iter().find(|&&(_, b)| b == Band::Send).map(|&(a, _)| a);
     let show_more = app.footer_open_ended();
-    let reserve = if show_more { 2 } else { 0 }; // a gap plus the `?`
+    let secondary = Style::default().fg(p.ink(Ink::TextSecondary, Fill::Bar));
 
-    // `send` and `?` never drop, so their width is reserved first.
+    // `send` never drops, so its width is reserved first.
     let send_w = send.map_or(0, |a| entry_width(app, a));
-    let tail = send_w + reserve;
 
     // Open, row 1 joins the labeled grid, if the `do` gutter leaves room for what never drops.
-    let primary_key_w = primary.map_or(0, |a| action_key_label(app, a).0.chars().count());
+    let primary_key_w = primary.map_or(0, |a| action_key_label(app, a).0.width());
     let labeled = app.keys_expanded
         && show_more
         && (primary.is_some() || !do_acts.is_empty())
-        && 1 + BAND_INDENT + primary_key_w + tail <= w;
-    let (mut spans, mut used): (Vec<Span<'static>>, usize) = if labeled {
+        && 1 + MORE_GUTTER + BAND_INDENT + primary_key_w + send_w <= w;
+    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+    let mut used = 1;
+    // `?` opens the row: before the `do` label, else as the first entry.
+    if labeled {
         let label = Span::styled(
             format!("{:<BAND_INDENT$}", "do"),
             Style::default().fg(p.ink(Ink::TextMuted, Fill::Bar)),
         );
-        (vec![Span::raw(" "), label], 1 + BAND_INDENT)
-    } else {
-        (vec![Span::raw(" ")], 1)
-    };
+        spans.extend([Span::styled("? ", secondary), label]);
+        used += MORE_GUTTER + BAND_INDENT;
+    } else if show_more {
+        spans.push(Span::styled("?", secondary));
+        used += 1;
+    }
+    // After a lone `?`, the row's first entry takes the separator the others carry.
+    let lead_sep = show_more && !labeled;
 
     // The `PR` tab leads with its state, unless the quit question owns the row.
     let pr_state =
         (app.tab == Tab::Pr && !app.confirming_quit).then(|| app.pr_snapshot()).flatten();
     if let Some(s) = pr_state {
+        if lead_sep {
+            spans.push(Span::styled(SEP, Style::default().fg(p.mark(Ink::Border, Fill::Bar))));
+            used += SEP.width();
+        }
         let primary_w = primary.map_or(0, |a| entry_body_width(app, a));
-        let budget = w.saturating_sub(used + primary_w + reserve + 4).max(8);
+        let budget = w.saturating_sub(used + primary_w + 4).max(8);
         let text = truncate_width(&format!("{}   ", pr_state_line(app, s)), budget);
-        used += text.chars().count();
+        used += text.width();
         spans.push(Span::styled(text, Style::default().fg(p.ink(Ink::TextSecondary, Fill::Bar))));
     }
 
-    // The primary sheds its label, then truncates its key, but never drops.
+    // The primary sheds its label, then truncates its key, and drops only with no column left.
     if let Some(a) = primary {
         let (key, label) = action_key_label(app, a);
-        let (key_style, label_style) = band_styles(Band::Primary, p);
-        let full =
-            key.chars().count() + if label.is_empty() { 0 } else { 1 + label.chars().count() };
-        if used + full + tail <= w || !show_more {
-            spans.push(Span::styled(key, key_style));
-            if !label.is_empty() {
-                spans.push(Span::styled(format!(" {label}"), label_style));
-            }
-            used += full;
-        } else if used + key.chars().count() + tail <= w {
-            used += key.chars().count();
-            spans.push(Span::styled(key, key_style));
+        let full = entry_body_width(app, a);
+        // A tight row trades the separator after `?` for a space before it sheds the label.
+        let lead = if !lead_sep || pr_state.is_some() {
+            ""
+        } else if used + SEP.width() + full + send_w <= w {
+            SEP
         } else {
-            let room = w.saturating_sub(used + tail);
-            let key = truncate_width(&key, room);
-            used += key.chars().count();
-            spans.push(Span::styled(key, key_style));
+            " "
+        };
+        let room = w.saturating_sub(used + lead.width() + send_w);
+        if room > 0 || !show_more {
+            spans.push(Span::styled(lead, Style::default().fg(p.mark(Ink::Border, Fill::Bar))));
+            used += lead.width();
+            let (key_style, label_style) = band_styles(Band::Primary, p);
+            if full <= room || !show_more {
+                spans.push(Span::styled(key, key_style));
+                if !label.is_empty() {
+                    spans.push(Span::styled(format!(" {label}"), label_style));
+                }
+                used += full;
+            } else {
+                let key = truncate_width(&key, room);
+                used += key.width();
+                spans.push(Span::styled(key, key_style));
+            }
         }
     }
 
     // The status outranks the actions, which `?` repeats; it reserves only the room it can use.
-    let status_tail =
-        send_w + if do_acts.is_empty() { reserve } else { reserve.max(MORE_ELLIPSIS) };
-    let free = w.saturating_sub(used + status_tail);
+    let ellipsis_room = if show_more || do_acts.is_empty() { 0 } else { MORE_ELLIPSIS };
+    let free = w.saturating_sub(used + send_w + ellipsis_room);
     let status_w = if app.status.is_empty()
         || app.confirming_quit
         || app.switch_question().is_some()
@@ -3079,6 +3143,12 @@ fn footer_row1(app: &App, w: usize) -> (Vec<Span<'static>>, Vec<FooterAction>) {
         (STATUS_FRAME + app.status.width()).min(free)
     };
 
+    // The worktree name outranks actions `?` repeats; a modal's own actions outrank it.
+    let (folder, checkout) = app.worktree_name();
+    let worktree = |room: usize| fit_worktree(&folder, checkout, room.checked_sub(WORKTREE_FRAME)?);
+    let reserved = worktree(free - status_w).filter(|_| show_more);
+    let worktree_w = reserved.map_or(0, |name| WORKTREE_FRAME + name.width());
+
     // Pack the actions; the rest spill to the `do` band.
     let mut overflow = Vec::new();
     let mut trimming = false;
@@ -3087,9 +3157,9 @@ fn footer_row1(app: &App, w: usize) -> (Vec<Span<'static>>, Vec<FooterAction>) {
         let ew = widths[i];
         // A trimming entry leaves room for the modal's `…`.
         let rest: usize = widths[i + 1..].iter().sum();
-        let fits_all = used + ew + rest + send_w + status_w + reserve <= w;
+        let fits_all = used + ew + rest + send_w + status_w + worktree_w <= w;
         let ellipsis = if show_more || fits_all { 0 } else { MORE_ELLIPSIS };
-        if trimming || used + ew + send_w + status_w + reserve + ellipsis > w {
+        if trimming || used + ew + send_w + status_w + worktree_w + ellipsis > w {
             trimming = true;
             overflow.push(a);
             continue;
@@ -3107,9 +3177,10 @@ fn footer_row1(app: &App, w: usize) -> (Vec<Span<'static>>, Vec<FooterAction>) {
     }
 
     // The status, truncated into its reserved room.
+    let trimmed = !show_more && !overflow.is_empty();
     if status_w > 0 {
-        let more = if overflow.is_empty() { reserve } else { reserve.max(MORE_ELLIPSIS) };
-        let room = w.saturating_sub(used + STATUS_FRAME + more);
+        let more = if trimmed { MORE_ELLIPSIS } else { 0 };
+        let room = w.saturating_sub(used + STATUS_FRAME + more + worktree_w);
         if room >= STATUS_MIN {
             let text = format!("  · {} ", truncate_width(&app.status, room));
             used += text.width();
@@ -3117,15 +3188,36 @@ fn footer_row1(app: &App, w: usize) -> (Vec<Span<'static>>, Vec<FooterAction>) {
         }
     }
 
-    // `?` at the right, or a modal's `…` when it trimmed.
-    if show_more {
-        let pad = w.saturating_sub(used + 1);
-        spans.push(Span::raw(" ".repeat(pad)));
-        spans.push(Span::styled("?", Style::default().fg(p.ink(Ink::TextSecondary, Fill::Bar))));
-    } else if !overflow.is_empty() {
+    // A modal's `…` when it trimmed.
+    if trimmed {
+        used += MORE_ELLIPSIS;
         spans.push(Span::styled(" …", Style::default().fg(p.ink(Ink::TextMuted, Fill::Bar))));
     }
+
+    // The worktree on screen closes the row, unless a modal trimmed its actions to fit.
+    if let Some(name) = worktree(w.saturating_sub(used)).filter(|_| !trimmed) {
+        spans.push(Span::raw(" ".repeat(w.saturating_sub(used + name.width() + 1))));
+        spans.push(Span::styled(format!("{name} "), secondary));
+    }
     (spans, overflow)
+}
+
+/// The footer's `folder · branch` within `room`: the folder gives way down to its `…`, then the
+/// branch stands alone, cut from its head last; `None` when not even that fits.
+fn fit_worktree(folder: &str, checkout: Option<&str>, room: usize) -> Option<String> {
+    let alone = |name: &str| {
+        if name.width() <= room {
+            (!name.is_empty()).then(|| name.to_string())
+        } else {
+            (room >= WORKTREE_MIN).then(|| cut_head(name, room))
+        }
+    };
+    let Some(branch) = checkout else { return alone(folder) };
+    let tail = format!("{SEP}{branch}");
+    if folder.is_empty() || room <= tail.width() {
+        return alone(branch);
+    }
+    Some(format!("{}{tail}", cut_head(folder, room - tail.width())))
 }
 
 /// One `?` band: a dim label, then its keys wrapped beneath.
@@ -3141,12 +3233,17 @@ fn render_band(
     }
     let p = app.palette();
     let label_style = Style::default().fg(p.ink(Ink::TextMuted, Fill::Bar));
-    let avail = w.saturating_sub(1 + BAND_INDENT);
+    // Bands sit under row 1's `?`, indented past it.
+    let gutter = " ".repeat(1 + MORE_GUTTER);
+    let avail = w.saturating_sub(gutter.len() + BAND_INDENT);
     let start = |first: bool| -> Vec<Span<'static>> {
         if first {
-            vec![Span::raw(" "), Span::styled(format!("{label:<BAND_INDENT$}"), label_style)]
+            vec![
+                Span::raw(gutter.clone()),
+                Span::styled(format!("{label:<BAND_INDENT$}"), label_style),
+            ]
         } else {
-            vec![Span::raw(" ".repeat(1 + BAND_INDENT))]
+            vec![Span::raw(" ".repeat(gutter.len() + BAND_INDENT))]
         }
     };
 
@@ -3544,7 +3641,11 @@ pub fn hit_base_picker_row(area: Rect, app: &App, col: u16, row: u16) -> Option<
 
 /// A worktree row's name and trail for `width`: the path clips from its start before the name.
 fn worktree_row_parts(row: &crate::app::WorktreeChoice, width: usize) -> (String, String) {
-    let mark = if row.current { "● current  " } else { "" };
+    let mark = match (row.current, row.home) {
+        (true, _) => "● current  ",
+        (false, true) => "home  ",
+        (false, false) => "",
+    };
     let room =
         width.saturating_sub(name_trail_width(&row.name, "") + MENU_TRAIL_GAP + mark.width());
     (row.name.clone(), format!("{mark}{}", elide_head(&row.shown_path, room)))

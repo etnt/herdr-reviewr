@@ -233,9 +233,11 @@ pub struct WorktreeChoice {
     /// The path with the home directory as `~`.
     pub shown_path: String,
     pub current: bool,
+    /// The worktree this pane opened on.
+    pub home: bool,
 }
 
-/// The open worktree picker: this clone's worktrees, the current first, then by branch.
+/// The open worktree picker: this clone's worktrees, the current first, then home, then by branch.
 #[derive(Clone, Debug)]
 pub struct WorktreePicker {
     pub rows: Vec<WorktreeChoice>,
@@ -788,6 +790,10 @@ pub struct App {
     common_dir: std::cell::OnceCell<Option<PathBuf>>,
     /// Whether the last listing held another worktree to switch to; `None` until first listed.
     other_worktrees: Option<bool>,
+    /// The worktree this pane opened on, kept across switches.
+    pub home: PathBuf,
+    /// What the worktree on screen has checked out, as the last world build read it.
+    checkout: Option<String>,
     /// The read-only `PR` tab's view of the pull request.
     pub pr: forge::PrView,
     /// The resolved target's forge, which picks the display noun.
@@ -907,6 +913,7 @@ impl App {
         let last_turn = baseline.map_or(crate::turn::LastTurn::Waiting, crate::turn::LastTurn::At);
         let theme = theme::resolve(None);
         Self {
+            home: repo.clone(),
             repo,
             base,
             branch_base: git::BaseStatus::default(),
@@ -983,6 +990,7 @@ impl App {
             switch_to: None,
             common_dir: std::cell::OnceCell::new(),
             other_worktrees: None,
+            checkout: None,
             pr: forge::PrView::Pending,
             pr_forge: crate::git::Forge::GitHub,
             pr_notice: None,
@@ -1090,8 +1098,9 @@ impl App {
         }
     }
 
-    /// Carry the pane's layout: the footer expansion, the navigator, the split and the search split.
+    /// Carry the pane's own state: where it opened, the footer expansion, the navigator and splits.
     fn carry_layout_from(&mut self, old: &Self) {
+        self.home.clone_from(&old.home);
         self.keys_expanded = old.keys_expanded;
         self.navigator_side_pct = old.navigator_side_pct;
         self.navigator_stack_pct = old.navigator_stack_pct;
@@ -1152,8 +1161,9 @@ impl App {
                 self.reveal_files = old.reveal_files;
                 self.reveal_diff = old.reveal_diff;
                 self.changeset = std::mem::take(&mut old.changeset);
-                // The header describes the carried list, so it carries too.
+                // The header and the footer's branch describe the carried list, so they carry too.
                 self.branch_base = std::mem::take(&mut old.branch_base);
+                self.checkout = old.checkout.take();
                 self.pick_status = old.pick_status.take();
                 self.diff = std::mem::take(&mut old.diff);
                 self.visible = std::mem::take(&mut old.visible);
@@ -1286,12 +1296,9 @@ impl App {
         if self.other_worktrees.is_none() {
             self.relist_worktrees();
         }
-        // The `PR` tab has no file tree; a file tab reloads on return.
-        if !self.tab.is_file_tab() {
-            return Ok(());
-        }
-        // Outside a git repo, show an empty state rather than failing.
-        if !git::is_repo(&self.repo) {
+        // Outside a git repo, a file tab shows an empty state rather than failing.
+        if self.tab.is_file_tab() && !git::is_repo(&self.repo) {
+            self.checkout = None;
             self.entries.clear();
             self.changeset = Changeset::default();
             self.file_rows.clear();
@@ -1342,6 +1349,12 @@ impl App {
 
     /// Reconcile a snapshot into the view: identity, then fallback, then clamp (Continuity).
     pub fn reconcile_world(&mut self, snapshot: crate::world::WorldSnapshot) {
+        // The footer names the checkout this build read, in the frame its diff lands in.
+        self.checkout = snapshot.checkout;
+        // `PR` leaves the file tabs frozen; a file tab reloads on return.
+        if !self.tab.is_file_tab() {
+            return;
+        }
         // The cursor keeps its target, else the open file, else the first file.
         let anchor = self.cursor_anchor();
         let open = self.diff_path.clone();
@@ -5077,6 +5090,12 @@ impl App {
         self.other_worktrees == Some(true)
     }
 
+    /// The worktree on screen, for the footer: its folder, and its checkout once a build read it.
+    pub fn worktree_name(&self) -> (String, Option<&str>) {
+        let folder = self.repo.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        (folder, self.checkout.as_deref())
+    }
+
     /// List this clone's worktrees again for the footer, as the picker would list them.
     pub fn relist_worktrees(&mut self) {
         let others = self.worktree_rows().is_ok_and(|rows| rows.iter().any(|r| !r.current));
@@ -5086,6 +5105,7 @@ impl App {
     /// This clone's worktrees as picker rows, listed from the common dir, which outlives any one.
     fn worktree_rows(&self) -> Result<Vec<WorktreeChoice>, git::GitFail> {
         let here = git::canonical(&self.repo);
+        let home = git::canonical(&self.home);
         let common = self.common_dir.get_or_init(|| git::git_dirs(&self.repo).map(|(_, c)| c));
         let listed = git::worktrees(common.as_deref().unwrap_or(&self.repo))?;
         Ok(listed
@@ -5097,8 +5117,10 @@ impl App {
                         c.head.as_deref().map(git::abbreviate_oid).unwrap_or_default()
                     )
                 });
+                let at = git::canonical(&c.path);
                 WorktreeChoice {
-                    current: git::canonical(&c.path) == here,
+                    current: at == here,
+                    home: at == home,
                     shown_path: home_relative(&c.path),
                     path: c.path,
                     name,
@@ -5124,7 +5146,9 @@ impl App {
         if self.other_worktrees == Some(false) {
             return;
         }
-        rows.sort_by(|a, b| b.current.cmp(&a.current).then_with(|| a.name.cmp(&b.name)));
+        rows.sort_by(|a, b| {
+            (b.current, b.home).cmp(&(a.current, a.home)).then_with(|| a.name.cmp(&b.name))
+        });
         self.worktree_picker = Some(WorktreePicker {
             rows,
             cursor: 0,
@@ -5927,9 +5951,12 @@ mod tests {
         old.rendered.content =
             Some(crate::rendered::Content { text: "# doc".to_string(), old: None, nothing: false });
         old.rendered.details.insert("Details#0".to_string(), true);
+        old.checkout = Some("first".to_string());
 
         let mut recovered = App::new(PathBuf::from("."), Scope::Uncommitted, None);
+        recovered.checkout = Some("second".to_string()); // its load ran after a checkout
         recovered.carry_authored_state_from(&mut old);
+        assert_eq!(recovered.worktree_name().1, Some("first"), "the branch of the carried view");
 
         assert!(recovered.markdown_rendered, "the pane's choice survives a modal's recovery");
         assert_eq!(recovered.split_chosen, Some(DiffView::Split), "so does split");

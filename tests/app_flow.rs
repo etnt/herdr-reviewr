@@ -7,7 +7,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use common::{FakeTarget, Repo, UnifiedRow as _, app_on, app_on_rendered, enter_tab, typed};
-use herdr_reviewr::app::{App, Band, Focus, FooterAction, Mode};
+use herdr_reviewr::app::{App, Band, Focus, FooterAction, Mode, Tab};
 use herdr_reviewr::config::NavigatorPosition;
 use herdr_reviewr::diff::{Bar, MarkerKind, RenderedKind, Row};
 use herdr_reviewr::export::ExportTarget;
@@ -4832,6 +4832,14 @@ fn a_reveal_completion_settles_the_tab_and_rearms_the_cursor_reveal() {
     assert!(herdr_reviewr::land_world_completion(&mut app, landing, &live(2)).live());
     assert!(app.reveal_files, "a switch-originated landing re-reveals the re-anchored cursor");
     assert!(app.entries.iter().any(|f| f.path == "c.rs"), "the landing caught up");
+
+    // On `PR`, a reveal lands only the footer's checkout and leaves the frozen file tab be.
+    app.set_tab(Tab::Pr).unwrap();
+    let mut landing = completion_for(&app, 3);
+    landing.reveal = true;
+    app.reveal_files = false;
+    assert!(herdr_reviewr::land_world_completion(&mut app, landing, &live(3)).live());
+    assert!(!app.reveal_files, "nothing on the frozen file tab moves");
 }
 
 #[test]

@@ -47,6 +47,8 @@ tempfile = "3"
 time = { version = "0.3", features = ["parsing"] }
 toml = "1.1"
 two-face = "0.5.2"
+# Already in the tree through ratatui. Cuts a name's head by display width, graphemes whole.
+unicode-truncate = "2.0.1"
 unicode-width = "0.2"
 # Program lookup the way a shell does it: the executable bit on unix, PATHEXT on Windows
 # (so `az` finds `az.cmd`), and never the current directory for a bare name.
@@ -104,6 +106,11 @@ cast_possible_truncation = "allow"
 cast_sign_loss = "allow"
 cast_possible_wrap = "allow"
 too_many_lines = "allow"
+
+# unicode-truncate asserts a cut's width is its graphemes' sum, which unicode-width 0.2 breaks on
+# Arabic lam-alef. Release builds compile the assert out; debug builds and tests match them.
+[profile.dev.package.unicode-truncate]
+debug-assertions = false
 
 [profile.release]
 strip = true

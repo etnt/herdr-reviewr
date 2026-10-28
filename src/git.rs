@@ -856,7 +856,12 @@ pub fn list_branches(repo: &Path) -> Result<Vec<BranchRow>, GitFail> {
 
 /// The checked-out branch's bare name, `None` when `HEAD` is detached.
 pub fn checked_out_branch(repo: &Path) -> Result<Option<String>, GitFail> {
-    git_tristate(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+    Ok(git_tristate(repo, &["symbolic-ref", "--quiet", "HEAD"])?.as_deref().and_then(branch_name))
+}
+
+/// A branch ref's bare name; git's short form reads `heads/main` beside a tag `main`.
+fn branch_name(full: &str) -> Option<String> {
+    full.strip_prefix("refs/heads/").map(str::to_string)
 }
 
 /// `path` as the OS resolves it, so two spellings of one directory compare equal.
@@ -896,7 +901,7 @@ fn parse_worktrees(out: &str) -> Vec<Checkout> {
             }
             ("HEAD", Some((entry, _))) => entry.head = Some(value.to_string()),
             ("branch", Some((entry, _))) => {
-                entry.branch = Some(value.strip_prefix("refs/heads/").unwrap_or(value).to_string());
+                entry.branch = branch_name(value);
             }
             ("bare" | "prunable", Some((_, skip))) => *skip = true,
             _ => {}
@@ -2036,6 +2041,16 @@ pub fn parent_or_empty(repo: &Path, sha: &str) -> Option<String> {
 /// `HEAD`'s commit, `None` while unborn.
 pub fn head_oid(repo: &Path) -> Option<String> {
     git_line(repo, &["rev-parse", "--verify", "-q", "HEAD"])
+}
+
+/// `HEAD`'s commit and branch in one read: a detached `HEAD` has no branch, an unborn one no commit.
+pub fn head_and_branch(repo: &Path) -> (Option<String>, Option<String>) {
+    let Some(out) = git_line(repo, &["rev-parse", "HEAD", "--symbolic-full-name", "HEAD"]) else {
+        return (None, checked_out_branch(repo).ok().flatten());
+    };
+    let mut lines = out.lines();
+    let head = lines.next().map(str::to_string);
+    (head, lines.next().and_then(branch_name))
 }
 
 /// `sha`'s subject line, for the header paint.

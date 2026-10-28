@@ -96,7 +96,7 @@ pub fn run() -> Result<()> {
         let Some(target) = app.switch_to.take().filter(|_| result.is_ok()) else { break result };
         git::end_sessions();
         cfg.repo.clone_from(&target.path);
-        app = switched_app(&cfg, &mut app, &target.name);
+        app = switched_app(&cfg, &mut app);
         if let Err(error) = paint_then_load(&mut terminal, &mut app) {
             restore_terminal();
             break Err(error);
@@ -275,14 +275,12 @@ fn ready_app(cfg: &Config, plugin_config: PluginConfig) -> App {
     app
 }
 
-/// The pane restarted on `cfg.repo`, the worktree `name`: what a pane opened there would be,
-/// viewed as `old` viewed, not loaded yet.
-pub fn switched_app(cfg: &Config, old: &mut App, name: &str) -> App {
+/// The pane restarted on `cfg.repo`: what a pane opened there would be, viewed as `old` viewed,
+/// not loaded yet.
+pub fn switched_app(cfg: &Config, old: &mut App) -> App {
     let plugin_config = config::plugin_config(cfg.plugin_config_dir.as_deref());
     let mut app = app_for(cfg, &plugin_config);
     app.carry_view_from(old);
-    // A toggle closes the pane, so the switch lasts exactly as long as it does.
-    app.status = format!("reviewing {name} until this pane closes");
     app
 }
 
@@ -713,7 +711,8 @@ pub fn land_world_completion(
             if app.config_error().is_none() && app.world_input() == completion.input =>
         {
             app.reconcile_world(snapshot);
-            if completion.reveal {
+            // `PR` lands only the footer's checkout, so its focus stays put.
+            if completion.reveal && app.tab.is_file_tab() {
                 // The landing may have moved the cursor.
                 app.settle_tab_entry();
                 app.reveal_files = true;
@@ -1160,7 +1159,7 @@ fn event_loop(
                     full: request.refresh.is_full(),
                     reveal: request.reveal,
                     running: Some(Instant::now()),
-                    // The `PR` tab builds nothing.
+                    // The `PR` tab reads only the checkout.
                     builds: input.tab.is_file_tab(),
                 };
                 let job = crate::world::WorldJob {
@@ -3729,7 +3728,7 @@ mod refresh_tests {
 
         let mut cfg = opened.clone();
         cfg.repo.clone_from(&wt);
-        let mut app = crate::switched_app(&cfg, &mut old, "other");
+        let mut app = crate::switched_app(&cfg, &mut old);
         app.set_config_error("unknown key".into());
         let (tx, rx) = crate::wake::channel(&crate::wake::Waker::detached());
         let (mut epoch, mut inflight) = (0, false);
@@ -3745,5 +3744,6 @@ mod refresh_tests {
         recovered.carry_authored_state_from(&mut app);
         let canonical = crate::git::canonical;
         assert_eq!(canonical(&recovered.repo), canonical(&wt), "the switched worktree");
+        assert_eq!(canonical(&recovered.home), canonical(dir.path()), "where the pane opened");
     }
 }
