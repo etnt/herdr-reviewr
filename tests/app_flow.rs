@@ -1387,7 +1387,8 @@ fn a_failed_export_keeps_comments_and_success_consumes_them() {
     // The sent text is the real export block format, end to end through App::export.
     let sent = target.last();
     assert!(sent.contains("one") && sent.contains("two"), "both comment texts present: {sent:?}");
-    assert!(sent.lines().next().is_some_and(|l| l.starts_with("a.rs:")), "leads with a location");
+    let head = format!("Worktree: {}\n\na.rs:", app.repo.display());
+    assert!(sent.starts_with(&head), "leads with its worktree, then a location: {sent:?}");
     assert!(sent.contains("\n\n"), "blocks separated by a blank line: {sent:?}");
     assert!(
         sent.lines().any(|l| l.starts_with('+') || l.starts_with('-')),
@@ -1419,13 +1420,15 @@ fn the_review_prefix_heads_every_export_from_the_current_config() {
     let target = FakeTarget::ok();
     app.export(&target);
     let sent = target.last();
-    assert!(sent.starts_with("/address-review\n\na.rs:"), "prefix, blank line, comments: {sent:?}");
+    let worktree = format!("Worktree: {}\n\n", app.repo.display());
+    let head = format!("/address-review\n\n{worktree}a.rs:");
+    assert!(sent.starts_with(&head), "prefix, worktree, comments: {sent:?}");
 
     std::fs::write(&path, "theme = \"nord\"\n").unwrap();
     app.set_plugin_config(herdr_reviewr::config::plugin_config_in(dir.path()).unwrap());
     comment_on(&mut app, '+', "two");
     app.export(&target);
-    assert!(target.last().starts_with("a.rs:"), "unset, the review leads with a comment");
+    assert!(target.last().starts_with(&worktree), "unset, the review leads with its worktree");
 }
 
 #[test]
@@ -5711,13 +5714,7 @@ mod search_overlay {
 // --- Agent picker ------------------------------------
 
 fn choice(pane: &str, name: &str) -> AgentChoice {
-    AgentChoice {
-        pane_id: pane.into(),
-        name: name.into(),
-        state: "idle".into(),
-        tab: "1".into(),
-        cwd: None,
-    }
+    AgentChoice { pane_id: pane.into(), name: name.into(), state: "idle".into(), tab: "1".into() }
 }
 
 fn three_agents() -> Vec<AgentChoice> {
@@ -7995,7 +7992,7 @@ fn a_commit_comment_renders_only_while_the_scope_reads_that_commit() {
     // The list and the export carry both, unchanged.
     assert_eq!(app.store.len(), 2);
     let all: Vec<&herdr_reviewr::model::Comment> = app.store.iter().collect();
-    let text = herdr_reviewr::export::format_review(None, None, &all);
+    let text = herdr_reviewr::export::format_review(None, &app.repo, &all);
     assert!(text.contains("worktree note") && text.contains("commit note"));
 }
 
@@ -8389,7 +8386,7 @@ fn a_rendered_comment_equals_the_source_comment() {
     app.start_comment();
     write_comment(&mut app, "tighten this");
     let rendered = app.store.get(0).unwrap().clone();
-    let rendered_export = herdr_reviewr::export::format_review(None, None, &[&rendered]);
+    let rendered_export = herdr_reviewr::export::format_review(None, &app.repo, &[&rendered]);
     assert_eq!((rendered.side, rendered.start, rendered.end), (Side::New, 3, 4));
     assert_eq!(
         rendered.lines, " alpha one\n-beta two\n+BETA TWO",
@@ -8407,7 +8404,8 @@ fn a_rendered_comment_equals_the_source_comment() {
     write_comment(&mut app, "tighten this");
     let source = app.store.get(0).unwrap().clone();
     assert_eq!(source, rendered, "same side, range, snippet, kind, and rev");
-    assert_eq!(herdr_reviewr::export::format_review(None, None, &[&source]), rendered_export);
+    let source_export = herdr_reviewr::export::format_review(None, &app.repo, &[&source]);
+    assert_eq!(source_export, rendered_export);
 
     // Two rendered blocks anchor lines 1..=4, the blank between included.
     app.store.take(0);
@@ -8420,7 +8418,7 @@ fn a_rendered_comment_equals_the_source_comment() {
     let rendered = app.store.take(0).unwrap();
     assert_eq!((rendered.side, rendered.start, rendered.end), (Side::New, 1, 4));
     assert_eq!(rendered.lines, " # Title\n \n alpha one\n-beta two\n+BETA TWO");
-    let rendered_export = herdr_reviewr::export::format_review(None, None, &[&rendered]);
+    let rendered_export = herdr_reviewr::export::format_review(None, &app.repo, &[&rendered]);
 
     app.toggle_rendered();
     app.diff_cursor = app.visible.iter().position(|r| r.new_no() == Some(1)).unwrap();
@@ -8430,7 +8428,8 @@ fn a_rendered_comment_equals_the_source_comment() {
     write_comment(&mut app, "both");
     let source = app.store.get(0).unwrap();
     assert_eq!(*source, rendered, "a multi-block range equals the contiguous source range");
-    assert_eq!(herdr_reviewr::export::format_review(None, None, &[source]), rendered_export);
+    let source_export = herdr_reviewr::export::format_review(None, &app.repo, &[source]);
+    assert_eq!(source_export, rendered_export);
 }
 
 /// Comment the first `-` row in source, then return its card's rendered row.
@@ -8988,7 +8987,7 @@ fn a_removed_marker_comment_anchors_the_deleted_lines_on_the_old_side() {
     assert_eq!(c.side, Side::Old);
     assert!(c.lines.contains("-gone para"), "{:?}", c.lines);
     assert!(!c.lines.contains("keep"), "a marker stands for its own lines alone");
-    let out = herdr_reviewr::export::format_review(None, None, &[&c]);
+    let out = herdr_reviewr::export::format_review(None, &app.repo, &[&c]);
     assert!(out.contains("(removed)"), "{out}");
     // Its card sits under the marker.
     assert_eq!(app.card_rows(), vec![(marker, 0)]);
@@ -9875,7 +9874,7 @@ fn the_diff_agrees_with_git_diff_under_any_line_ending_rule() {
         typed(&mut app, "why?");
         app.submit_comment();
         let all: Vec<&herdr_reviewr::model::Comment> = app.store.iter().collect();
-        let export = herdr_reviewr::export::format_review(None, None, &all);
+        let export = herdr_reviewr::export::format_review(None, &app.repo, &all);
         assert!(export.contains(&lines[1]) && !export.contains('\r'), "{case}: {export:?}");
 
         app.open_search();
@@ -9934,7 +9933,7 @@ fn an_untracked_or_renamed_crlf_file_reads_like_git() {
     typed(&mut app, "why?");
     app.submit_comment();
     let all: Vec<&herdr_reviewr::model::Comment> = app.store.iter().collect();
-    assert!(!herdr_reviewr::export::format_review(None, None, &all).contains('\r'));
+    assert!(!herdr_reviewr::export::format_review(None, &app.repo, &all).contains('\r'));
     app.select_file(file_row_of(&app, "moved.txt").expect("moved.txt listed")).unwrap();
     assert!(change_rows(&app).is_empty(), "{:?}", change_rows(&app));
 }

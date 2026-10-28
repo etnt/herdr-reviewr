@@ -3745,6 +3745,5 @@ mod refresh_tests {
         recovered.carry_authored_state_from(&mut app);
         let canonical = crate::git::canonical;
         assert_eq!(canonical(&recovered.repo), canonical(&wt), "the switched worktree");
-        assert_eq!(canonical(&recovered.opened_in), canonical(dir.path()));
     }
 }

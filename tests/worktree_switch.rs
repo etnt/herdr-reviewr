@@ -218,7 +218,6 @@ fn a_switch_reviews_the_pick_and_keeps_only_the_view() {
     old.wrap = false;
     old.set_scope(Scope::Branch).unwrap();
     old.store.add(Comment { text: "stays behind".into(), ..comment() });
-    let opened_in = old.opened_in.clone();
     // Where herdr last saw this pane, which a move changes after launch.
     old.herdr.ids.pane = Some("w9:p3".into());
     old.herdr.ids.workspace = Some("w9".into());
@@ -232,7 +231,6 @@ fn a_switch_reviews_the_pick_and_keeps_only_the_view() {
     assert_eq!(switched.store.len(), 0, "comments stay with the worktree they were made on");
     assert_eq!(switched.scope, Scope::Branch, "the scope carries");
     assert!(!switched.wrap, "wrap carries");
-    assert_eq!(switched.opened_in, opened_in, "a switch never moves where the pane opened");
     assert_eq!(
         switched.herdr.ids.pane.as_deref(),
         Some("w9:p3"),
@@ -243,31 +241,27 @@ fn a_switch_reviews_the_pick_and_keeps_only_the_view() {
 }
 
 #[test]
-fn a_copy_names_the_worktree_once_the_pane_switched() {
+fn a_review_names_the_worktree_on_screen_before_and_after_a_switch() {
     let repo = Repo::init();
     repo.write("main.txt", "base\n");
     repo.commit_all("base");
     let wt = repo.add_worktree("company-pages");
     std::fs::write(wt.path().join("main.txt"), "edited\n").unwrap();
     repo.write("main.txt", "edited\n");
+    let review =
+        |at: &std::path::Path| format!("Worktree: {}\n\nmain.txt:1\n+edited\nunsent", at.display());
 
     let mut old = app_on(&repo);
     old.store.add(comment());
     let copied = FakeTarget::ok();
     assert!(old.export(&copied));
-    assert_eq!(copied.last(), "main.txt:1\n+edited\nunsent", "where it opened: today's review");
+    assert_eq!(copied.last(), review(repo.path()));
 
     let mut switched = switch_to(&mut old, wt.path(), "company-pages");
+    assert_eq!(canonical(&switched.repo), canonical(wt.path()), "the pick, not where it opened");
     switched.store.add(comment());
     assert!(switched.export(&copied));
-    let expected = format!("Worktree: {}\n\nmain.txt:1\n+edited\nunsent", switched.repo.display());
-    assert_eq!(copied.last(), expected);
-
-    // Back where it opened, the review needs no worktree line again.
-    let mut back = switch_to(&mut switched, repo.path(), "main");
-    back.store.add(comment());
-    assert!(back.export(&copied));
-    assert_eq!(copied.last(), "main.txt:1\n+edited\nunsent");
+    assert_eq!(copied.last(), review(&switched.repo));
 }
 
 #[test]

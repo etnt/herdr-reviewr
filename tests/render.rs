@@ -3059,13 +3059,7 @@ mod search_row_emphasis {
 // --- Agent picker ----------------------------------------------------
 
 fn agent_row(pane: &str, name: &str, state: &str, tab: &str) -> AgentChoice {
-    AgentChoice {
-        pane_id: pane.into(),
-        name: name.into(),
-        state: state.into(),
-        tab: tab.into(),
-        cwd: None,
-    }
+    AgentChoice { pane_id: pane.into(), name: name.into(), state: state.into(), tab: tab.into() }
 }
 
 /// One saved comment on the first added line, so the picker has a count to title itself with.
@@ -3393,8 +3387,8 @@ fn the_worktree_picker_paints_its_rows_and_clicks_land_on_them() {
         .collect();
     assert_eq!(rows.into_iter().collect::<Vec<_>>(), [0, 1], "both rows, the filter line skipped");
 
-    // Narrow, the path gives way from its head and the branch stays whole.
-    let narrow = dump(&render_size(&app, 50, 20));
+    // Narrower than the shortest temp path's row (Linux), the path gives way from its head.
+    let narrow = dump(&render_size(&app, 32, 20));
     let pages = narrow.lines().find(|l| l.contains("company-pages")).expect("the other row");
     assert!(pages.contains('…'), "{narrow}");
 }

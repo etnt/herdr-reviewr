@@ -48,8 +48,6 @@ pub struct AgentChoice {
     pub name: String,
     pub state: String,
     pub tab: String,
-    /// Where the agent works, so a review can name the worktree it is about.
-    pub cwd: Option<String>,
 }
 
 /// What `Send` does with the agents herdr reports; a refusal is [`send_target`]'s `Err`.
@@ -473,7 +471,6 @@ impl AgentPane {
             name: self.row_name(),
             state: self.row_state(),
             tab: tabs.get(&self.tab_id).cloned().unwrap_or_default(),
-            cwd: self.cwd.clone(),
         }
     }
 
@@ -1075,14 +1072,12 @@ mod tests {
                     name: "claude".into(),
                     state: "working".into(),
                     tab: "Grip Outreach".into(),
-                    cwd: None,
                 },
                 AgentChoice {
                     pane_id: "w8:p2".into(),
                     name: "release-bot".into(),
                     state: "working".into(),
                     tab: String::new(),
-                    cwd: None,
                 },
             ]
         );

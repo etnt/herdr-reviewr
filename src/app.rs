@@ -784,8 +784,6 @@ pub struct App {
     pub confirming_quit: bool,
     /// The worktree this pane restarts on when the frame loop next returns.
     pub switch_to: Option<WorktreeChoice>,
-    /// The worktree the pane opened in, which a switch never changes.
-    pub opened_in: PathBuf,
     /// This clone's git common dir, asked of git once; `None` outside a repo.
     common_dir: std::cell::OnceCell<Option<PathBuf>>,
     /// Whether the last listing held another worktree to switch to; `None` until first listed.
@@ -909,7 +907,6 @@ impl App {
         let last_turn = baseline.map_or(crate::turn::LastTurn::Waiting, crate::turn::LastTurn::At);
         let theme = theme::resolve(None);
         Self {
-            opened_in: repo.clone(),
             repo,
             base,
             branch_base: git::BaseStatus::default(),
@@ -1117,7 +1114,6 @@ impl App {
         if old.scope != Scope::Commits {
             self.scope = old.scope;
         }
-        self.opened_in.clone_from(&old.opened_in);
         // What herdr said of the pane carries; what it said of the old worktree does not.
         let pane =
             std::mem::replace(&mut old.herdr, HerdrView::new(crate::turn::LastTurn::default()));
@@ -1131,7 +1127,6 @@ impl App {
         self.store = std::mem::take(&mut old.store);
         self.list_cursor = old.list_cursor;
         self.carry_layout_from(old);
-        self.opened_in.clone_from(&old.opened_in);
         // Session memory, like the comments.
         self.last_sent_pane = old.last_sent_pane.take();
         // The commit pick is session memory like the comments: replaced, never cleared
@@ -5421,40 +5416,20 @@ impl App {
     /// Export to one decided pane; only a delivery records it as `last used`.
     fn export_to_agent(&mut self, agent: &AgentChoice) {
         let target = Agent { pane: agent.pane_id.clone(), name: agent.name.clone() };
-        let worktree = self.worktree_for(agent.cwd.as_deref());
-        if self.deliver(&target, worktree.as_deref()) {
+        if self.export(&target) {
             self.last_sent_pane = Some(agent.pane_id.clone());
         }
     }
 
-    /// The worktree a review to an agent at `cwd` names: this one, when the agent's is another.
-    fn worktree_for(&self, cwd: Option<&str>) -> Option<PathBuf> {
-        let cwd = cwd.map(std::path::Path::new).filter(|c| c.is_absolute())?;
-        let ours = git::canonical(&self.repo);
-        // An agent at this worktree's root, the common case, needs no git to say so.
-        if git::canonical(cwd) == ours {
-            return None;
-        }
-        let git::Worktree::Root(theirs) = git::worktree_of(cwd) else { return None };
-        (git::canonical(&theirs) != ours).then(|| self.repo.clone())
-    }
-
-    /// Export every comment to `target`; a switched pane's review names its worktree.
-    pub fn export(&mut self, target: &dyn ExportTarget) -> bool {
-        let switched = git::canonical(&self.repo) != git::canonical(&self.opened_in);
-        let worktree = switched.then(|| self.repo.clone());
-        self.deliver(target, worktree.as_deref())
-    }
-
     /// Export every comment to `target`, consuming them only on success, which it returns.
-    fn deliver(&mut self, target: &dyn ExportTarget, worktree: Option<&std::path::Path>) -> bool {
+    pub fn export(&mut self, target: &dyn ExportTarget) -> bool {
         if self.store.is_empty() {
             self.status = "no comments yet".to_string();
             return false;
         }
         let refs: Vec<&Comment> = self.store.iter().collect();
         let prefix = self.plugin_config().and_then(crate::config::PluginConfig::review_prefix);
-        let text = format_review(prefix, worktree, &refs);
+        let text = format_review(prefix, &self.repo, &refs);
         let n = refs.len();
         logln!("export ({n}) -> {} ::\n{text}", target.label());
         let delivered = match target.export(&text) {

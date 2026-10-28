@@ -33,6 +33,12 @@ const ONE_AGENT: &str = r#"{"result":{"agents":[
 /// A line break as the request's JSON spells it, CRLF on Windows.
 const NL: &str = if cfg!(windows) { r"\r\n" } else { r"\n" };
 
+/// The review's worktree line as the request's JSON spells it.
+fn worktree_line(app: &App) -> String {
+    let line = serde_json::to_string(&format!("Worktree: {}", app.repo.display())).unwrap();
+    line.trim_matches('"').to_owned()
+}
+
 /// What the fake socket does with each request it reads.
 #[derive(Clone, Copy, Debug)]
 enum Reply {
@@ -271,10 +277,11 @@ fn send_dispatches_one_agent_directly_and_several_through_the_picker() {
     assert_eq!(app.status, "sent 1 comment to codex");
     assert_eq!(app.last_sent_pane.as_deref(), Some("w8:p2"));
     // The whole request herdr received.
+    let worktree = worktree_line(&app);
     assert_eq!(
         socket.requests().last().unwrap(),
         &format!(
-            r#"{{"id":"reviewr:send","method":"pane.send_text","params":{{"pane_id":"w8:p2","text":"\u001b[200~a.rs:2{NL}+beta{NL}two\u001b[201~"}}}}"#
+            r#"{{"id":"reviewr:send","method":"pane.send_text","params":{{"pane_id":"w8:p2","text":"\u001b[200~{worktree}{NL}{NL}a.rs:2{NL}+beta{NL}two\u001b[201~"}}}}"#
         )
     );
     assert!(herdr_calls(&fake_dir).contains("agent focus w8:p2"), "a send focuses its pane");
@@ -385,8 +392,9 @@ fn a_send_consumes_the_comments_only_on_a_result_reply() {
     let keymap = Keymap::default();
     let area = Rect::new(0, 0, 80, 24);
     write_comment(&mut app, "naming");
+    let worktree = worktree_line(&app);
     let request = format!(
-        r#"{{"id":"reviewr:send","method":"pane.send_text","params":{{"pane_id":"w8:p1","text":"\u001b[200~a.rs:2{NL}+beta{NL}naming\u001b[201~"}}}}"#
+        r#"{{"id":"reviewr:send","method":"pane.send_text","params":{{"pane_id":"w8:p1","text":"\u001b[200~{worktree}{NL}{NL}a.rs:2{NL}+beta{NL}naming\u001b[201~"}}}}"#
     );
 
     for (reply, status) in [
@@ -431,10 +439,11 @@ fn a_long_review_sends_whole_and_one_over_the_cap_refuses() {
     press(&mut app, KeyCode::Char('s'), area, &keymap);
     assert!(app.store.is_empty(), "a review just under the cap sends");
     assert_eq!(app.status, "sent 1 comment to claude");
+    let worktree = worktree_line(&app);
     assert_eq!(
         socket.requests().last().unwrap(),
         &format!(
-            r#"{{"id":"reviewr:send","method":"pane.send_text","params":{{"pane_id":"w8:p1","text":"\u001b[200~a.rs:2{NL}+beta{NL}{long}\u001b[201~"}}}}"#
+            r#"{{"id":"reviewr:send","method":"pane.send_text","params":{{"pane_id":"w8:p1","text":"\u001b[200~{worktree}{NL}{NL}a.rs:2{NL}+beta{NL}{long}\u001b[201~"}}}}"#
         )
     );
 
@@ -477,45 +486,4 @@ fn a_send_without_a_socket_refuses_as_herdr_not_answering() {
     press(&mut app, KeyCode::Char('s'), area, &keymap);
     assert_eq!(app.status, "herdr didn't answer, press y to copy");
     assert_eq!(app.store.len(), 1, "a refusal keeps every comment");
-}
-
-/// One agent, idle in `cwd`, as `herdr agent list` reports it.
-fn agent_at(cwd: &Path) -> String {
-    let cwd = serde_json::to_string(&cwd.to_string_lossy()).unwrap();
-    format!(
-        r#"{{"result":{{"agents":[{{"agent":"claude","agent_status":"idle","pane_id":"w8:p1","tab_id":"w8:t1","workspace_id":"w8","cwd":{cwd}}}]}}}}"#
-    )
-}
-
-/// A review names its worktree exactly when the agent works in another one.
-#[test]
-fn a_review_to_an_agent_in_another_worktree_names_this_one() {
-    if !in_child() {
-        let dir = run_in_child("a_review_to_an_agent_in_another_worktree_names_this_one", true);
-        assert!(herdr_calls(dir.path()).contains("agent focus"), "the child delivered no send");
-        return;
-    }
-
-    let socket = FakeSocket::serve(&socket_path());
-    let (repo, mut app) = app();
-    let elsewhere = repo.add_worktree("company-pages");
-    let keymap = Keymap::default();
-    let area = Rect::new(0, 0, 80, 24);
-    let line = serde_json::to_string(&format!("Worktree: {}", app.repo.display())).unwrap();
-    let line = line.trim_matches('"');
-
-    agents(&fixture_dir(), &agent_at(elsewhere.path()));
-    write_comment(&mut app, "naming");
-    press(&mut app, KeyCode::Char('s'), area, &keymap);
-    assert!(app.store.is_empty(), "{}", app.status);
-    let sent = socket.requests().last().cloned().unwrap();
-    assert!(sent.contains(&format!(r#""text":"\u001b[200~{line}{NL}{NL}a.rs:2"#)), "{sent}");
-
-    // An agent in this worktree, at a subdirectory, gets today's review byte for byte.
-    std::fs::create_dir_all(repo.path().join("sub")).unwrap();
-    agents(&fixture_dir(), &agent_at(&repo.path().join("sub")));
-    write_comment(&mut app, "naming");
-    press(&mut app, KeyCode::Char('s'), area, &keymap);
-    let sent = socket.requests().last().cloned().unwrap();
-    assert!(sent.contains(&format!(r#""text":"\u001b[200~a.rs:2{NL}+beta{NL}naming"#)), "{sent}");
 }
