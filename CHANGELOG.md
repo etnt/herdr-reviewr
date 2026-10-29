@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.49.0] — 2026-10-29
+
 ### Added
 - **Worktree switch**: `W` lists this repo's worktrees, and a pick reviews that one in the same pane until it closes.
   Thanks [@cajames](https://github.com/cajames) ([#152](https://github.com/persiyanov/herdr-reviewr/pull/152)) and [@jmoreno-blr](https://github.com/jmoreno-blr) ([#115](https://github.com/persiyanov/herdr-reviewr/issues/115)).
