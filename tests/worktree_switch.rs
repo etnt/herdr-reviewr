@@ -252,6 +252,32 @@ fn w_opens_on_a_lone_worktree_and_is_silent_outside_a_repo() {
 }
 
 #[test]
+fn a_worktree_re_added_from_another_clone_lists_that_clones_worktrees() {
+    let (a, b) = (Repo::init(), Repo::init());
+    for r in [&a, &b] {
+        r.write("main.txt", "base\n");
+        r.commit_all("base");
+    }
+    let wt = a.add_worktree("x");
+    let at = wt.path().to_str().unwrap().to_string();
+    let mut app = App::new(wt.path().to_path_buf(), Scope::Uncommitted, None);
+    app.reload().unwrap();
+    let paths = |app: &App| -> Vec<_> {
+        let wp = app.worktree_picker.as_ref().expect("the picker is open");
+        wp.rows.iter().map(|r| canonical(&r.path)).collect()
+    };
+    press(&mut app, KeyCode::Char('W'));
+    assert_eq!(paths(&app), [canonical(wt.path()), canonical(a.path())]);
+    press(&mut app, KeyCode::Esc);
+
+    a.git(&["worktree", "remove", "--force", &at]);
+    b.git(&["worktree", "add", "-q", "-b", "x", &at]);
+    press(&mut app, KeyCode::Char('W'));
+    let now = [canonical(wt.path()), canonical(b.path())];
+    assert_eq!(paths(&app), now, "the clone its `.git` names now");
+}
+
+#[test]
 fn a_main_worktree_git_lists_by_its_git_dir_reads_as_itself() {
     // `--separate-git-dir`, a submodule and a symlinked `.git` list their main worktree as the git dir.
     let layouts: &[bool] = if cfg!(unix) { &[false, true] } else { &[false] };

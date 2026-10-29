@@ -124,11 +124,18 @@ pub fn worktree_of(path: &Path) -> Worktree {
 
 /// The worktree's own git dir and the common dir, canonical; the same in a main checkout.
 pub fn git_dirs(repo: &Path) -> Option<(PathBuf, PathBuf)> {
-    let out = git(repo, &["rev-parse", "--absolute-git-dir", "--git-common-dir"]).ok()?;
-    let mut lines = out.lines();
-    let dir = PathBuf::from(lines.next()?);
-    let common = repo.join(lines.next()?);
+    let (dir, common) = dirs(repo).ok()?;
     Some((dir.canonicalize().ok()?, common.canonicalize().ok()?))
+}
+
+/// The worktree's own git dir and the common dir, as one `rev-parse` names them.
+fn dirs(repo: &Path) -> Result<(PathBuf, PathBuf)> {
+    let out = git(repo, &["rev-parse", "--absolute-git-dir", "--git-common-dir"])?;
+    let mut lines = out.lines();
+    let (Some(dir), Some(common)) = (lines.next(), lines.next()) else {
+        bail!("git rev-parse named no git dir in {}", repo.display());
+    };
+    Ok((PathBuf::from(dir), repo.join(common)))
 }
 
 /// The global ignore file git reads: `core.excludesFile`, else git's default under the XDG dir.
@@ -1958,10 +1965,8 @@ fn session(repo: &Path) -> Result<Arc<RepoSession>> {
     if let Some(found) = sessions().live.get(repo).filter(current) {
         return Ok(Arc::clone(found));
     }
-    let dirs = git(repo, &["rev-parse", "--absolute-git-dir", "--git-common-dir"])?;
-    let mut dirs = dirs.lines();
-    let git_dir = PathBuf::from(dirs.next().unwrap_or_default());
-    let common_dir = canonical(&repo.join(dirs.next().unwrap_or_default()));
+    let (git_dir, common_dir) = dirs(repo)?;
+    let common_dir = canonical(&common_dir);
     let mut sessions = sessions();
     if let Some(found) = sessions.live.get(repo).filter(current) {
         return Ok(Arc::clone(found));
