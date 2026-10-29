@@ -1473,13 +1473,12 @@ fn handle_blocked_event(app: &mut App, event: &Event) {
                 KeyCode::Char(c) => keymap::default_keymap().action_for(keymap::Key::plain(c)),
                 _ => None,
             };
-            // A blocked pane closed its picker, so the only question it asks is quit's.
-            match (app.question.is_some(), action) {
-                (true, Some(keymap::Action::QuitDiscard)) => app.should_quit = true,
-                (true, Some(keymap::Action::Quit)) => {}
-                (true, _) => app.question = None,
-                (false, Some(keymap::Action::Quit)) => app.request_quit(),
-                (false, _) => {}
+            match (&app.question, action) {
+                (Some(Question::Quit), Some(keymap::Action::QuitDiscard)) => app.should_quit = true,
+                (Some(Question::Quit), Some(keymap::Action::Quit)) => {}
+                (Some(_), _) => app.question = None,
+                (None, Some(keymap::Action::Quit)) => app.request_quit(),
+                (None, _) => {}
             }
         }
         Event::Mouse(m) if app.question.is_some() && answers_question(m.kind) => {

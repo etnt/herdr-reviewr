@@ -3214,7 +3214,7 @@ fn footer_row1(app: &App, w: usize) -> (Vec<Span<'static>>, Vec<FooterAction>) {
     (spans, overflow)
 }
 
-/// The footer's `folder · branch` in `room`, folder cut first; `None` if empty or too long under `WORKTREE_MIN`.
+/// `folder · branch` in `room`, folder cut first; `None` if empty or too long under `WORKTREE_MIN`.
 fn fit_worktree(folder: &str, checkout: Option<&str>, room: usize) -> Option<String> {
     let alone = |name: &str| {
         if name.width() <= room {

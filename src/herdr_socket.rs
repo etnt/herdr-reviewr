@@ -86,9 +86,10 @@ impl Connection {
     ) -> std::io::Result<Self> {
         let (me, rx) = mpsc::channel();
         let queue = me.clone();
+        // Turn snapshots run git on `repo`, even after a switch let go of it.
+        let session = crate::git::lease_session(&repo);
         std::thread::Builder::new().name("herdr".into()).spawn(move || {
-            // Turn snapshots run git on `repo`.
-            let _session = crate::git::lease_session(&repo);
+            let _session = session;
             let mut thread = Thread {
                 socket,
                 pane_id,

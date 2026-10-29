@@ -137,6 +137,12 @@ fn unsent_comments_get_the_switch_question() {
     assert_eq!(app.mode, Mode::WorktreePick);
     assert_eq!(row_names(&app), ["company-pages"], "the stray key never reached the filter");
 
+    // Quit's discard key is quit's alone: here it answers like any other key.
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('Q'));
+    assert!(!app.should_quit && app.switch_question().is_none());
+    assert_eq!(app.mode, Mode::WorktreePick);
+
     // Esc, a paste, or a click answers it the same way.
     press(&mut app, KeyCode::Enter);
     press(&mut app, KeyCode::Esc);

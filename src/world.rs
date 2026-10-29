@@ -470,11 +470,12 @@ pub fn spawn(
     rx: Receiver<WorldJob>,
     tx: crate::wake::Sender<WorldCompletion>,
 ) -> std::thread::JoinHandle<()> {
+    // Taken before the spawn: a switch can leave this worker finishing a build after its loop let go.
+    let session = git::lease_session(&repo);
     std::thread::Builder::new()
         .name("world".into())
         .spawn(move || {
-            // A switch can leave this worker finishing a build after its loop let go.
-            let _session = git::lease_session(&repo);
+            let _session = session;
             git::sweep_dead_copies(&repo);
             let mut worker = Worker::default();
             while let Ok(mut job) = rx.recv() {

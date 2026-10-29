@@ -3428,7 +3428,7 @@ fn the_worktree_picker_paints_its_rows_and_clicks_land_on_them() {
     let pages = narrow.lines().find(|l| l.contains("company-pages")).expect("the other row");
     assert!(pages.contains('…'), "{narrow}");
 
-    // Switched away, the pane's first worktree reads `home`, under the current one, over an earlier branch.
+    // Switched away, the pane's first worktree reads `home`, under the current, over earlier branches.
     let _alpha = r.add_worktree("alpha");
     let mut away = App::new(wt.path().to_path_buf(), Scope::Uncommitted, None);
     away.home = r.path().to_path_buf();
