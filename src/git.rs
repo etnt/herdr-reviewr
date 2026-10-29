@@ -1917,6 +1917,11 @@ fn git_dir(repo: &Path) -> Result<PathBuf> {
     Ok(session(repo)?.git_dir.clone())
 }
 
+/// `repo`'s canonical common dir, asked once per worktree like its git dir; `None` outside a repo.
+pub fn common_dir(repo: &Path) -> Option<PathBuf> {
+    Some(session(repo).ok()?.common_dir.clone())
+}
+
 /// What reviewr keeps about one worktree for the session: its git dir, its index copy, its last
 /// build's untracked counts, and the blob sizes it has asked for.
 #[derive(Default)]
@@ -1924,6 +1929,8 @@ struct RepoSession {
     /// What `<repo>/.git` held when the git dir was read: a linked worktree's pointer, else `None`.
     pointer: Option<String>,
     git_dir: PathBuf,
+    /// The clone's common dir, canonical: the worktree picker lists from it.
+    common_dir: PathBuf,
     copy: Mutex<Option<IndexCopy>>,
     /// Where the session copy's index file lives, so a snapshot seeds from it without its lock.
     copy_file: Mutex<Option<PathBuf>>,
@@ -1951,12 +1958,15 @@ fn session(repo: &Path) -> Result<Arc<RepoSession>> {
     if let Some(found) = sessions().live.get(repo).filter(current) {
         return Ok(Arc::clone(found));
     }
-    let git_dir = PathBuf::from(git(repo, &["rev-parse", "--absolute-git-dir"])?.trim());
+    let dirs = git(repo, &["rev-parse", "--absolute-git-dir", "--git-common-dir"])?;
+    let mut dirs = dirs.lines();
+    let git_dir = PathBuf::from(dirs.next().unwrap_or_default());
+    let common_dir = canonical(&repo.join(dirs.next().unwrap_or_default()));
     let mut sessions = sessions();
     if let Some(found) = sessions.live.get(repo).filter(current) {
         return Ok(Arc::clone(found));
     }
-    let made = RepoSession { pointer, git_dir, ..RepoSession::default() };
+    let made = RepoSession { pointer, git_dir, common_dir, ..RepoSession::default() };
     let made = Arc::new(made);
     sessions.live.insert(repo.to_path_buf(), Arc::clone(&made));
     Ok(made)

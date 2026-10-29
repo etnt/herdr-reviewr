@@ -143,6 +143,15 @@ fn unsent_comments_get_the_switch_question() {
     assert!(!app.should_quit && app.switch_question().is_none());
     assert_eq!(app.mode, Mode::WorktreePick);
 
+    // A config error blocks the pane: it closes the picker and its question with it.
+    let mut blocked = app_on(&repo);
+    blocked.store.add(comment());
+    press(&mut blocked, KeyCode::Char('W'));
+    type_text(&mut blocked, "comp");
+    press(&mut blocked, KeyCode::Enter);
+    blocked.set_config_error("invalid config".into());
+    assert!(blocked.switch_question().is_none() && blocked.worktree_picker.is_none());
+
     // Esc, a paste, or a click answers it the same way.
     press(&mut app, KeyCode::Enter);
     press(&mut app, KeyCode::Esc);
@@ -231,6 +240,15 @@ fn w_opens_on_a_lone_worktree_and_is_silent_outside_a_repo() {
     app.reload().unwrap();
     press(&mut app, KeyCode::Char('W'));
     assert_eq!((app.mode.clone(), app.status.as_str()), (Mode::Normal, ""));
+
+    // The failed read was not kept: once the folder is a repo, `W` lists it.
+    let made = std::process::Command::new("git")
+        .args(["-C", plain.path().to_str().unwrap(), "init", "-q"])
+        .status()
+        .unwrap();
+    assert!(made.success());
+    press(&mut app, KeyCode::Char('W'));
+    assert_eq!(rows(&app), [(canonical(plain.path()), true)]);
 }
 
 #[test]

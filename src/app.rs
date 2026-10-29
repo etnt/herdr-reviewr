@@ -797,8 +797,6 @@ pub struct App {
     pub switch_to: Option<PathBuf>,
     /// The worktree this pane opened on, kept across switches.
     pub home: PathBuf,
-    /// This clone's common dir, once read: the worktree picker lists from it.
-    common_dir: std::cell::OnceCell<PathBuf>,
     /// The checkout the active file tab's list was built from.
     checkout: Option<String>,
     /// The checkout the latest full build read, which `PR` names, as it leaves the file tabs frozen.
@@ -923,7 +921,6 @@ impl App {
         let theme = theme::resolve(None);
         Self {
             home: repo.clone(),
-            common_dir: std::cell::OnceCell::new(),
             repo,
             base,
             branch_base: git::BaseStatus::default(),
@@ -5111,16 +5108,11 @@ impl App {
 
     /// This clone's worktrees as picker rows, listed from the common dir, which outlives any one.
     fn worktree_rows(&self) -> Result<Vec<WorktreeChoice>, git::GitFail> {
-        // Outside a repo there is nothing to list; only a found dir is kept.
-        let common = if let Some(common) = self.common_dir.get() {
-            common
-        } else {
-            let Some((_, common)) = git::git_dirs(&self.repo) else { return Ok(Vec::new()) };
-            self.common_dir.get_or_init(|| common)
-        };
+        // Outside a repo there is nothing to list.
+        let Some(common) = git::common_dir(&self.repo) else { return Ok(Vec::new()) };
         let here = git::canonical(&self.repo);
         let home = git::canonical(&self.home);
-        let listed = git::worktrees(common, &[&self.repo, &self.home])?;
+        let listed = git::worktrees(&common, &[&self.repo, &self.home])?;
         Ok(listed
             .into_iter()
             .map(|c| {
