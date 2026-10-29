@@ -2581,7 +2581,8 @@ fn write_in_turn(
     body: &str,
 ) {
     r.write(path, body);
-    let later = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    // Far enough ahead that a slow runner never finishes the next turn's start snapshot past it.
+    let later = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let paths = Some([path.to_string()].into());
     host.on_worktree_change(&herdr_reviewr::turn::Wrote { first: later, last: later, paths });
     app.sync_turn(host.status());
