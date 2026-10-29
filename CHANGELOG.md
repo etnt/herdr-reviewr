@@ -13,7 +13,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 - **Every review names its worktree**: a send or copy carries `Worktree: <path>` after `review_prefix`, ahead of the comments.
-- **Footer**: the worktree on screen, as `folder · branch`, closes the row at the right, and `?` moves to the left.
+- **Footer**: the worktree on screen, as `folder · branch` (once when they match), closes the row at the right, and `?` moves to the left.
+- **Last turn** follows this workspace's agents when none works in the reviewed worktree, so a switched pane still tracks turns.
 
 ### Fixed
 - **A branch that shares a tag's name** reads as itself, not `heads/<name>`, in the PR tab and the base picker.

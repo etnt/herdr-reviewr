@@ -37,8 +37,6 @@ pub enum GitChange {
     Attributes,
     /// A private ref under `refs/worktree/reviewr/` another process wrote; reviewr's own writes drop.
     ReviewrRefs,
-    /// A worktree of this clone came or went: an entry under the common dir's `worktrees/`.
-    Worktrees,
 }
 
 /// What changed since the last batch.
@@ -496,11 +494,6 @@ fn classify_common_dir(rel: &Path) -> Class {
         "config" => Class::Git(GitChange::Config),
         "info/exclude" => Class::Git(GitChange::IgnoreRules),
         "info/attributes" => Class::Git(GitChange::Attributes),
-        // The folder itself or one worktree's entry; what a worktree keeps inside drops.
-        "worktrees" => Class::Git(GitChange::Worktrees),
-        _ if rel.strip_prefix("worktrees/").is_some_and(|name| !name.contains('/')) => {
-            Class::Git(GitChange::Worktrees)
-        }
         _ if rel.starts_with("refs/") => Class::Ref(rel),
         _ if rel.starts_with("reftable/") => Class::Git(GitChange::Refs),
         _ => Class::Drop,
@@ -648,8 +641,6 @@ impl State {
                 }
                 match classify(&self.layout, path) {
                     Class::Worktree(rel) => paths.push((rel, structural, *at)),
-                    // Only an entry made, removed or renamed is a worktree coming or going.
-                    Class::Git(GitChange::Worktrees) if !structural => {}
                     Class::Git(change) => {
                         batch.git.insert(change);
                     }
@@ -687,13 +678,6 @@ impl State {
         #[cfg(target_os = "linux")]
         if batch.git.contains(&GitChange::Index) {
             linux::watch_tracked(watcher, &self.layout.root, failed);
-        }
-        // The first worktree added makes `worktrees/` itself, which then needs its own watch.
-        #[cfg(target_os = "linux")]
-        if batch.git.contains(&GitChange::Worktrees)
-            && let Some((_, common)) = &self.layout.git
-        {
-            linux::watch_worktrees(watcher, common);
         }
         self.query_ignored(paths.iter().map(|(p, ..)| p.as_str()));
         // A `.gitignore` outside every ignored directory can flip any verdict: ask again under it.
@@ -1192,23 +1176,12 @@ mod linux {
             if common.join("info").is_dir() {
                 watcher.watch(&common.join("info"), RecursiveMode::NonRecursive)?;
             }
-            watch_worktrees(watcher, common);
         }
         super::watch_outside(watcher, layout)?;
         watch_tracked(watcher, &layout.root, &mut failed);
         match failed {
             Some(reason) => Err(notify::Error::generic(&reason)),
             None => Ok(Watches { walked }),
-        }
-    }
-
-    /// Watch the common dir's `worktrees/` for entries coming and going, once git has made it.
-    pub(super) fn watch_worktrees(watcher: &mut notify::RecommendedWatcher, common: &Path) {
-        let dir = common.join("worktrees");
-        if dir.is_dir()
-            && let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive)
-        {
-            crate::logln!("watch {} failed: {e}", dir.display());
         }
     }
 
@@ -1442,7 +1415,6 @@ mod tests {
         ] {
             assert_eq!(c(&l, noise), Class::Drop, "{noise} changes nothing a refresh shows");
         }
-        assert_eq!(c(&l, "/w/.git/worktrees/other"), Class::Git(GitChange::Worktrees));
     }
 
     #[test]
@@ -1464,9 +1436,6 @@ mod tests {
         );
         assert_eq!(c(&l, "/main/.git/packed-refs"), Class::Git(GitChange::Refs));
         assert_eq!(c(&l, "/main/.git/info/exclude"), Class::Git(GitChange::IgnoreRules));
-        // A sibling's entry, and the folder the first one made, are worktrees coming and going.
-        assert_eq!(c(&l, "/main/.git/worktrees/other"), Class::Git(GitChange::Worktrees));
-        assert_eq!(c(&l, "/main/.git/worktrees"), Class::Git(GitChange::Worktrees));
         for noise in [
             "/main/.git/HEAD",
             "/main/.git/index",

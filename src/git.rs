@@ -122,18 +122,6 @@ pub fn worktree_of(path: &Path) -> Worktree {
     }
 }
 
-/// `path`'s canonical git common dir, as `Root`, with [`worktree_of`]'s other two outcomes.
-pub fn common_dir_of(path: &Path) -> Worktree {
-    match git_command(path).args(["rev-parse", "--git-common-dir"]).output() {
-        Err(_) => Worktree::Unknown,
-        Ok(out) if !out.status.success() => Worktree::Outside,
-        Ok(out) => match String::from_utf8_lossy(&out.stdout).trim() {
-            "" => Worktree::Outside,
-            common => Worktree::Root(canonical(&path.join(common))),
-        },
-    }
-}
-
 /// The worktree's own git dir and the common dir, canonical; the same in a main checkout.
 pub fn git_dirs(repo: &Path) -> Option<(PathBuf, PathBuf)> {
     let out = git(repo, &["rev-parse", "--absolute-git-dir", "--git-common-dir"]).ok()?;
@@ -877,10 +865,24 @@ pub struct Checkout {
     pub branch: Option<String>,
 }
 
-/// This clone's worktrees in git's order, minus the bare (no files) and the prunable (no path).
-pub fn worktrees(repo: &Path) -> Result<Vec<Checkout>, GitFail> {
+/// The worktrees of the clone at canonical `common`, minus the bare, the prunable and the unlocatable.
+pub fn worktrees(common: &Path, known: &[&Path]) -> Result<Vec<Checkout>, GitFail> {
     // No `-z`: it needs git 2.36, and the line form is the same fields.
-    Ok(parse_worktrees(&git_strict(repo, &["worktree", "list", "--porcelain"])?))
+    let listed = parse_worktrees(&git_strict(common, &["worktree", "list", "--porcelain"])?);
+    // A submodule, `--separate-git-dir` or a symlinked `.git` lists its main worktree as the git dir.
+    let locate = |mut c: Checkout| {
+        if canonical(&c.path) == common {
+            let own = known.iter().find(|k| git_dirs(k).is_some_and(|(own, _)| own == common));
+            c.path = own.map(|k| k.to_path_buf()).or_else(|| toplevel(&c.path))?;
+        }
+        Some(c)
+    };
+    Ok(listed.into_iter().filter_map(locate).collect())
+}
+
+/// How a checkout reads: its branch, else `detached <short sha>`.
+pub fn checkout_name(branch: Option<String>, head: Option<&str>) -> Option<String> {
+    branch.or_else(|| head.map(|h| format!("detached {}", abbreviate_oid(h))))
 }
 
 /// Read `git worktree list --porcelain`: a field per line, a blank line ending each record.
@@ -1929,35 +1931,66 @@ struct RepoSession {
     sizes: Mutex<HashMap<String, u64>>,
 }
 
-/// Every live session by worktree.
-static SESSIONS: OnceLock<Mutex<HashMap<PathBuf, Arc<RepoSession>>>> = OnceLock::new();
+/// Every live session by worktree, and how many leases hold each worktree's.
+#[derive(Default)]
+struct Sessions {
+    live: HashMap<PathBuf, Arc<RepoSession>>,
+    leases: HashMap<PathBuf, usize>,
+}
+
+static SESSIONS: OnceLock<Mutex<Sessions>> = OnceLock::new();
+
+fn sessions() -> std::sync::MutexGuard<'static, Sessions> {
+    SESSIONS.get_or_init(Mutex::default).lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// `repo`'s session, made on first use and again when `.git` points elsewhere (a re-added worktree).
 fn session(repo: &Path) -> Result<Arc<RepoSession>> {
-    let sessions = SESSIONS.get_or_init(Mutex::default);
     let pointer = std::fs::read_to_string(repo.join(".git")).ok();
     let current = |s: &&Arc<RepoSession>| s.pointer == pointer;
-    if let Some(found) =
-        sessions.lock().unwrap_or_else(PoisonError::into_inner).get(repo).filter(current)
-    {
+    if let Some(found) = sessions().live.get(repo).filter(current) {
         return Ok(Arc::clone(found));
     }
     let git_dir = PathBuf::from(git(repo, &["rev-parse", "--absolute-git-dir"])?.trim());
-    let mut sessions = sessions.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(found) = sessions.get(repo).filter(current) {
+    let mut sessions = sessions();
+    if let Some(found) = sessions.live.get(repo).filter(current) {
         return Ok(Arc::clone(found));
     }
     let made = RepoSession { pointer, git_dir, ..RepoSession::default() };
     let made = Arc::new(made);
-    sessions.insert(repo.to_path_buf(), Arc::clone(&made));
+    sessions.live.insert(repo.to_path_buf(), Arc::clone(&made));
     Ok(made)
 }
 
-/// Drop every session, so each index copy no other thread holds leaves the git dir now.
-pub fn end_sessions() {
-    if let Some(sessions) = SESSIONS.get() {
-        sessions.lock().unwrap_or_else(PoisonError::into_inner).clear();
+/// A hold on `repo`'s session for as long as its holder runs git there; the last one ends it.
+#[must_use]
+#[derive(Debug)]
+pub struct SessionLease(PathBuf);
+
+pub fn lease_session(repo: &Path) -> SessionLease {
+    *sessions().leases.entry(repo.to_path_buf()).or_default() += 1;
+    SessionLease(repo.to_path_buf())
+}
+
+impl Drop for SessionLease {
+    fn drop(&mut self) {
+        let mut sessions = sessions();
+        let Some(held) = sessions.leases.get_mut(&self.0) else { return };
+        *held -= 1;
+        if *held == 0 {
+            sessions.leases.remove(&self.0);
+            // Dropped outside the lock: an index copy's removal is file work.
+            let ended = sessions.live.remove(&self.0);
+            drop(sessions);
+            drop(ended);
+        }
     }
+}
+
+/// Drop every session at exit, so each index copy no other thread holds leaves the git dir now.
+pub fn end_sessions() {
+    let ended = std::mem::take(&mut *sessions());
+    drop(ended);
 }
 
 /// The persisted turn baseline tree for this worktree, if a baseline exists.

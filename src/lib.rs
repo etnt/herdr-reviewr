@@ -60,7 +60,7 @@ use ratatui::layout::Rect;
 
 use std::process::Stdio;
 
-use crate::app::{App, Focus, Mode};
+use crate::app::{App, Focus, Mode, Question};
 use crate::config::{Config, PluginConfig};
 use crate::export::Clipboard;
 use crate::keymap::Keymap;
@@ -76,35 +76,56 @@ pub fn run() -> Result<()> {
     let initial_config = config::plugin_config(cfg.plugin_config_dir.as_deref());
     let mut app = app_for(&cfg, &initial_config);
 
-    let mut terminal = ratatui::init();
-    // `ratatui::init` claimed the screen and raw mode; the input modes are left.
-    claim_input_modes();
+    let mut screen = Screen::claim();
     // A cosmetic label, stamped on its own thread; identity is the process.
     herdr::label_pane(&app.herdr.ids);
-    if let Err(error) = paint_then_load(&mut terminal, &mut app) {
-        restore_terminal();
-        return Err(error);
-    }
+    let result = review(&mut screen, &mut cfg, &mut app);
+    screen.release();
+    herdr::clear_pane_label(&app.herdr.ids);
+    git::end_sessions();
+    result
+}
+
+/// Review until quit, restarting on each switch's pick in the same pane.
+fn review(screen: &mut Screen, cfg: &mut Config, app: &mut App) -> Result<()> {
+    let mut _session = git::lease_session(&app.repo);
+    paint_then_load(&mut screen.terminal, app)?;
     // An old command line hears what changed instead of quietly doing something else.
     if let Some(note) = &cfg.removed_flag {
         app.status.clone_from(note);
     }
     // Window editors outlive a switch, so the next loop reaps them.
     let mut open_editors = Vec::new();
-    let result = loop {
-        let result = event_loop(&mut terminal, &mut app, &cfg, &mut open_editors);
-        let Some(target) = app.switch_to.take().filter(|_| result.is_ok()) else { break result };
-        git::end_sessions();
-        cfg.repo.clone_from(&target.path);
-        app = switched_app(&cfg, &mut app);
-        if let Err(error) = paint_then_load(&mut terminal, &mut app) {
+    loop {
+        event_loop(screen, app, cfg, &mut open_editors)?;
+        let Some(switched) = switched_app(cfg, app) else { return Ok(()) };
+        *app = switched;
+        // The old worktree's session ends once its workers finish too.
+        _session = git::lease_session(&app.repo);
+        paint_then_load(&mut screen.terminal, app)?;
+    }
+}
+
+/// The screen claimed at startup, handed back once on the way out.
+struct Screen {
+    terminal: DefaultTerminal,
+    held: bool,
+}
+
+impl Screen {
+    fn claim() -> Self {
+        let terminal = ratatui::init();
+        // `ratatui::init` claimed the screen and raw mode; the input modes are left.
+        claim_input_modes();
+        Self { terminal, held: true }
+    }
+
+    /// Hand the screen back; a second call does nothing.
+    fn release(&mut self) {
+        if std::mem::take(&mut self.held) {
             restore_terminal();
-            break Err(error);
         }
-    };
-    herdr::clear_pane_label(&app.herdr.ids);
-    git::end_sessions();
-    result
+    }
 }
 
 /// Claim the input modes on a screen something else owns.
@@ -275,13 +296,13 @@ fn ready_app(cfg: &Config, plugin_config: PluginConfig) -> App {
     app
 }
 
-/// The pane restarted on `cfg.repo`: what a pane opened there would be, viewed as `old` viewed,
-/// not loaded yet.
-pub fn switched_app(cfg: &Config, old: &mut App) -> App {
+/// `old` restarted unloaded on the pick it asked for, `cfg` pointed there; `None` when it asked none.
+pub fn switched_app(cfg: &mut Config, old: &mut App) -> Option<App> {
+    cfg.repo = old.switch_to.take()?;
     let plugin_config = config::plugin_config(cfg.plugin_config_dir.as_deref());
     let mut app = app_for(cfg, &plugin_config);
     app.carry_view_from(old);
-    app
+    Some(app)
 }
 
 /// Paint, then load, so a hung `git` never leaves a blank or stale pane (issue #4).
@@ -710,9 +731,7 @@ pub fn land_world_completion(
         Some(Ok(snapshot))
             if app.config_error().is_none() && app.world_input() == completion.input =>
         {
-            app.reconcile_world(snapshot);
-            // `PR` lands only the footer's checkout, so its focus stays put.
-            if completion.reveal && app.tab.is_file_tab() {
+            if app.reconcile_world(snapshot) && completion.reveal {
                 // The landing may have moved the cursor.
                 app.settle_tab_entry();
                 app.reveal_files = true;
@@ -731,11 +750,11 @@ pub fn land_world_completion(
     }
 }
 
-/// Land what the watcher reported, which the pacer, PR probe, search and `W` hint follow.
-/// Whether the config must be read again.
+/// Land what the watcher reported: the pacer, the PR probe and search follow it. Whether the
+/// config must be read again.
 fn land_watch_event(
     event: crate::watch::WatchEvent,
-    app: &mut App,
+    app: &App,
     pacer: &mut crate::schedule::Pacer,
     pr: &mut PrCoordinator,
     search: Option<&mpsc::Sender<crate::search::SearchJob>>,
@@ -747,7 +766,6 @@ fn land_watch_event(
         WatchEvent::Ready => {
             pacer.set_watcher_down(false, now);
             pacer.on_batch(crate::world::Refresh::Full, now);
-            app.relist_worktrees();
             true
         }
         WatchEvent::Batch(batch) => {
@@ -759,9 +777,6 @@ fn land_watch_event(
             );
             if batch.git.iter().any(|g| g.moves_pr_input()) {
                 schedule_pr_probe(pr, app.tab);
-            }
-            if batch.rescan || batch.git.contains(&crate::watch::GitChange::Worktrees) {
-                app.relist_worktrees();
             }
             // The search engine has no watcher of its own: new ignore rules rescan it.
             let rules = batch.git.contains(&crate::watch::GitChange::IgnoreRules);
@@ -849,11 +864,12 @@ fn glyph_clears(lit_for: Duration) -> bool {
 
 /// Draw, then sleep until input, a worker's result, or the nearest armed deadline.
 fn event_loop(
-    terminal: &mut DefaultTerminal,
+    screen: &mut Screen,
     app: &mut App,
     cfg: &Config,
     open_editors: &mut Vec<std::process::Child>,
 ) -> Result<()> {
+    let terminal = &mut screen.terminal;
     // The config is read at the first frame and again only when the watcher says it changed.
     let mut config_dirty = true;
     // When the last mouse event came, and whether it sat on the pane's edge.
@@ -861,10 +877,9 @@ fn event_loop(
     let mut mouse_exited = false;
     let mut last_pr_poll = Instant::now();
     // The loop sleeps on input and this wake, rung only by its own workers and resizes.
-    // Failing before the guarded loop below, each restores the terminal itself.
-    let wake = crate::wake::Wake::new().inspect_err(|_| restore_terminal())?;
+    let wake = crate::wake::Wake::new()?;
     #[cfg(unix)]
-    let _resizes = wake.sys().watch_resizes().inspect_err(|_| restore_terminal())?;
+    let _resizes = wake.sys().watch_resizes()?;
     let waker = wake.waker();
     // Probes and forge reads run on workers.
     let (probe_tx, probe_rx) = crate::wake::channel::<(
@@ -881,9 +896,8 @@ fn event_loop(
     let _world_worker = crate::world::spawn(app.repo.clone(), world_job_rx, world_res_tx);
     // herdr pushes focus, this pane's moves, and agent statuses; outside herdr nothing connects.
     let (herdr_tx, herdr_rx) = crate::wake::channel::<crate::herdr_socket::HerdrEvent>(&waker);
-    // The live pane id, since a move or an earlier switch may have left the environment's stale.
-    let herdr = herdr::connection_target().and_then(|(socket, launched)| {
-        let pane = app.herdr.ids.pane.clone().unwrap_or(launched);
+    // The pane as herdr last saw it, since a move or an earlier switch leaves the environment's stale.
+    let herdr = herdr::socket_path().zip(app.herdr.ids.pane.clone()).and_then(|(socket, pane)| {
         crate::herdr_socket::Connection::start(socket, pane, app.repo.clone(), herdr_tx)
             .inspect_err(|e| logln!("herdr connection did not start: {e}"))
             .ok()
@@ -1437,10 +1451,9 @@ fn event_loop(
         }
         Ok(())
     })();
-    // A switch keeps the screen: the next loop paints over it, with no shell flash between.
-    // The process lives on through a switch, so dropping the coordinator cancels its fetch.
+    // Leaving hands the shell back before the bounded drain; a switch keeps the screen to paint over.
     if result.is_err() || app.switch_to.is_none() {
-        restore_terminal();
+        screen.release();
         drain_pr_shutdown(&mut pr, &probe_rx, &pr_rx);
     }
     result
@@ -1460,16 +1473,17 @@ fn handle_blocked_event(app: &mut App, event: &Event) {
                 KeyCode::Char(c) => keymap::default_keymap().action_for(keymap::Key::plain(c)),
                 _ => None,
             };
-            match (app.confirming_quit, action) {
+            // A blocked pane closed its picker, so the only question it asks is quit's.
+            match (app.question.is_some(), action) {
                 (true, Some(keymap::Action::QuitDiscard)) => app.should_quit = true,
                 (true, Some(keymap::Action::Quit)) => {}
-                (true, _) => app.confirming_quit = false,
+                (true, _) => app.question = None,
                 (false, Some(keymap::Action::Quit)) => app.request_quit(),
                 (false, _) => {}
             }
         }
-        Event::Mouse(m) if app.confirming_quit && answers_question(m.kind) => {
-            app.confirming_quit = false;
+        Event::Mouse(m) if app.question.is_some() && answers_question(m.kind) => {
+            app.question = None;
         }
         Event::Mouse(MouseEvent { kind: MouseEventKind::Up(MouseButton::Left), .. })
             if app.divider_drag_captured() =>
@@ -1803,20 +1817,24 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
     };
     let action = code.and_then(|code| keymap.action_for(crate::keymap::Key { ctrl, alt, code }));
 
-    // The quit question owns the keyboard; `q` leaves it open, so auto-repeat never answers it.
-    if app.confirming_quit {
+    // A question owns the keyboard: its key drops, `s`/`y` export, others stay, `q` repeats as no-op.
+    if app.question.is_some() {
+        let quit = app.question == Some(Question::Quit);
         match action {
-            Some(K::QuitDiscard) => app.should_quit = true,
-            Some(K::Quit) => {}
+            Some(K::QuitDiscard) if quit => app.should_quit = true,
+            Some(K::WorktreePick) if !quit => app.switch_discarding(),
+            Some(K::Quit) if quit => {}
             Some(K::Send) => {
-                app.confirming_quit = false;
+                app.close_worktree_picker();
+                app.question = None;
                 app.send_to_agent();
             }
             Some(K::Copy) => {
-                app.confirming_quit = false;
+                app.close_worktree_picker();
+                app.question = None;
                 app.export(&Clipboard);
             }
-            _ => app.confirming_quit = false,
+            _ => app.question = None,
         }
         return Ok(());
     }
@@ -1844,54 +1862,22 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
         return Ok(());
     }
 
-    // The switch question mirrors quit's: the bound switch key drops, `s`/`y` export and stay.
-    if app.switch_question().is_some() {
-        match action {
-            Some(K::WorktreePick) => app.switch_discarding(),
-            Some(K::Send) => {
-                app.close_worktree_picker();
-                app.send_to_agent();
-            }
-            Some(K::Copy) => {
-                app.close_worktree_picker();
-                app.export(&Clipboard);
-            }
-            _ => app.cancel_switch_question(),
-        }
-        return Ok(());
-    }
-
-    // Worktree picker: every printable filters, like the base picker; vertical keys move.
-    if app.mode == Mode::WorktreePick {
+    // Base and worktree pickers: every printable filters, so `qa` is typable; vertical keys move.
+    if matches!(app.mode, Mode::BasePick | Mode::WorktreePick) {
+        let base = app.mode == Mode::BasePick;
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let word = alt || ctrl;
         match key.code {
+            Esc if base => app.close_base_picker(),
             Esc => app.close_worktree_picker(),
+            Enter if base => app.base_picker_pick()?,
             Enter => app.worktree_picker_pick(),
-            Down => app.worktree_picker_move(1),
-            Up => app.worktree_picker_move(-1),
-            PageDown => app.worktree_picker_move(PAGE),
-            PageUp => app.worktree_picker_move(-PAGE),
-            Char('n') if ctrl => app.worktree_picker_move(1),
-            Char('p') if ctrl => app.worktree_picker_move(-1),
-            code => apply_text_edit(app, code, ctrl, alt, word),
-        }
-        return Ok(());
-    }
-
-    // Base picker: every printable filters, so a branch `qa` is typable; vertical keys move.
-    if app.mode == Mode::BasePick {
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
-        let word = alt || ctrl;
-        match key.code {
-            Esc => app.close_base_picker(),
-            Enter => app.base_picker_pick()?,
-            Down => app.base_picker_move(1),
-            Up => app.base_picker_move(-1),
-            PageDown => app.base_picker_move(PAGE),
-            PageUp => app.base_picker_move(-PAGE),
-            Char('n') if ctrl => app.base_picker_move(1),
-            Char('p') if ctrl => app.base_picker_move(-1),
+            Down => app.filter_picker_move(1),
+            Up => app.filter_picker_move(-1),
+            PageDown => app.filter_picker_move(PAGE),
+            PageUp => app.filter_picker_move(-PAGE),
+            Char('n') if ctrl => app.filter_picker_move(1),
+            Char('p') if ctrl => app.filter_picker_move(-1),
             code => apply_text_edit(app, code, ctrl, alt, word),
         }
         return Ok(());
@@ -2446,12 +2432,8 @@ fn dispatch_mouse(
 ) -> Result<()> {
     app.hover = Some((m.column, m.row));
     // A click or wheel only answers a question, by staying; a gesture under way finishes.
-    if app.confirming_quit && answers_question(m.kind) {
-        app.confirming_quit = false;
-        return Ok(());
-    }
-    if app.switch_question().is_some() && answers_question(m.kind) {
-        app.cancel_switch_question();
+    if app.question.is_some() && answers_question(m.kind) {
+        app.question = None;
         return Ok(());
     }
     // Buttonless motion or a new down proves the release was lost; complete it first.
@@ -2541,7 +2523,7 @@ fn dispatch_mouse(
                     Some(i) if app.base_picker.as_ref().is_some_and(|bp| bp.cursor == i) => {
                         app.base_picker_pick()?;
                     }
-                    Some(i) => app.base_picker_goto(i),
+                    Some(i) => app.filter_picker_goto(i),
                     None => {}
                 }
             }
@@ -2550,7 +2532,7 @@ fn dispatch_mouse(
                     Some(i) if app.worktree_picker.as_ref().is_some_and(|wp| wp.cursor == i) => {
                         app.worktree_picker_pick();
                     }
-                    Some(i) => app.worktree_picker_goto(i),
+                    Some(i) => app.filter_picker_goto(i),
                     None => {}
                 }
             }
@@ -2741,7 +2723,7 @@ mod refresh_tests {
         glyph_clears, handle_blocked_event, handle_resize, ready_app, schedule_pr_probe,
         world_indicator,
     };
-    use crate::app::{App, Tab};
+    use crate::app::{App, Question, Tab};
 
     #[test]
     fn a_recovery_saved_over_twice_recovers_to_the_newest_config() {
@@ -3020,7 +3002,7 @@ mod refresh_tests {
 
         // The frozen draft is unsent, so `q` asks and `Q` quits.
         handle_blocked_event(&mut app, &Event::Key(KeyEvent::from(KeyCode::Char('q'))));
-        assert!(app.confirming_quit && !app.should_quit);
+        assert!(app.question == Some(Question::Quit) && !app.should_quit);
         handle_blocked_event(&mut app, &Event::Key(KeyEvent::from(KeyCode::Char('Q'))));
         assert!(app.should_quit);
     }
@@ -3040,12 +3022,13 @@ mod refresh_tests {
         });
         app.set_config_error("invalid config".to_string());
         let q = Event::Key(KeyEvent::from(KeyCode::Char('q')));
+        let asking = |app: &App| app.question == Some(Question::Quit);
         handle_blocked_event(&mut app, &q);
-        assert!(app.confirming_quit && !app.should_quit, "the first `q` asks");
+        assert!(asking(&app) && !app.should_quit, "the first `q` asks");
         handle_blocked_event(&mut app, &q);
-        assert!(app.confirming_quit && !app.should_quit, "a repeated `q` never answers");
+        assert!(asking(&app) && !app.should_quit, "a repeated `q` never answers");
         handle_blocked_event(&mut app, &Event::Key(KeyEvent::from(KeyCode::Esc)));
-        assert!(!app.confirming_quit && !app.should_quit, "any other key answers and stays");
+        assert!(!asking(&app) && !app.should_quit, "any other key answers and stays");
         handle_blocked_event(&mut app, &q);
         let click = Event::Mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -3054,7 +3037,7 @@ mod refresh_tests {
             modifiers: KeyModifiers::NONE,
         });
         handle_blocked_event(&mut app, &click);
-        assert!(!app.confirming_quit && !app.should_quit, "a click answers and stays");
+        assert!(!asking(&app) && !app.should_quit, "a click answers and stays");
         handle_blocked_event(&mut app, &q);
         handle_blocked_event(&mut app, &Event::Key(KeyEvent::from(KeyCode::Char('Q'))));
         assert!(app.should_quit, "asked, `Q` quits");
@@ -3065,7 +3048,7 @@ mod refresh_tests {
         app.input = "half a thought".to_string();
         app.set_config_error("invalid config".to_string());
         handle_blocked_event(&mut app, &q);
-        assert!(app.confirming_quit && !app.should_quit, "a draft makes `q` ask");
+        assert!(asking(&app) && !app.should_quit, "a draft makes `q` ask");
     }
 
     #[test]
@@ -3686,34 +3669,6 @@ mod refresh_tests {
     }
 
     #[test]
-    fn the_w_hint_follows_the_watcher_reporting_worktrees() {
-        let (dir, git) = crate::test_support::test_repo();
-        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
-        git(&["add", "-A"]);
-        git(&["commit", "-qm", "a"]);
-        let mut app = App::new(dir.path().to_path_buf(), Scope::Uncommitted, None);
-        app.reload().unwrap();
-        let (mut pacer, mut pr) = (crate::schedule::Pacer::default(), PrCoordinator::new(true));
-        let mut land = |app: &mut App, event| {
-            super::land_watch_event(event, app, &mut pacer, &mut pr, None);
-            app.has_other_worktrees()
-        };
-        let linked = tempfile::tempdir().unwrap();
-        let wt = linked.path().join("wt");
-        git(&["worktree", "add", "-q", "-b", "other", wt.to_str().unwrap()]);
-        let paths =
-            crate::watch::Batch { worktree: ["a.txt".to_string()].into(), ..Default::default() };
-        assert!(!land(&mut app, crate::watch::WatchEvent::Batch(paths)), "an edit lists nothing");
-        let came = crate::watch::Batch {
-            git: [crate::watch::GitChange::Worktrees].into(),
-            ..Default::default()
-        };
-        assert!(land(&mut app, crate::watch::WatchEvent::Batch(came)), "a worktree came");
-        git(&["worktree", "remove", wt.to_str().unwrap()]);
-        assert!(!land(&mut app, crate::watch::WatchEvent::Ready), "the live watcher lists again");
-    }
-
-    #[test]
     fn recovery_after_a_switch_rebuilds_on_the_worktree_on_screen() {
         let (dir, git) = crate::test_support::test_repo();
         std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
@@ -3727,8 +3682,8 @@ mod refresh_tests {
         let mut old = crate::app_for(&opened, &Ok(crate::PluginConfig::default()));
 
         let mut cfg = opened.clone();
-        cfg.repo.clone_from(&wt);
-        let mut app = crate::switched_app(&cfg, &mut old);
+        old.switch_to = Some(wt.clone());
+        let mut app = crate::switched_app(&mut cfg, &mut old).expect("a switch was asked");
         app.set_config_error("unknown key".into());
         let (tx, rx) = crate::wake::channel(&crate::wake::Waker::detached());
         let (mut epoch, mut inflight) = (0, false);

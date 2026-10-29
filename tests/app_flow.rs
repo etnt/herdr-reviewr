@@ -6002,7 +6002,7 @@ fn the_picker_owns_the_whole_footer_bar() {
 fn goto_row(app: &mut App, name: &str) {
     let bp = app.base_picker.as_ref().expect("picker open");
     let i = bp.visible().iter().position(|r| r.name() == name).expect("row listed");
-    app.base_picker_goto(i);
+    app.filter_picker_goto(i);
 }
 
 /// Branch `feature` beside `dev` and default `main`, with one committed edit.
@@ -6120,7 +6120,7 @@ fn picking_the_default_deletes_the_pick() {
     app.open_base_picker();
     let bp = app.base_picker.as_ref().unwrap();
     assert_eq!(bp.rows[bp.cursor].name(), "dev", "the highlight opens on the current base");
-    app.base_picker_goto(0);
+    app.filter_picker_goto(0);
     app.base_picker_pick().unwrap();
     assert_eq!(app.scope, Scope::Branch);
     assert_eq!(
@@ -6298,7 +6298,7 @@ fn a_typed_revision_is_one_more_row_below_the_matches() {
     assert_eq!(shown, ["v1.2-hotfix", "v1.2"]);
     assert_eq!(bp.visible()[bp.cursor].name(), "v1.2-hotfix", "a hit never moves the highlight");
     assert_eq!(bp.visible()[1].oid(), Some(tagged.as_str()));
-    app.base_picker_move(1);
+    app.filter_picker_move(1);
     app.base_picker_pick().unwrap();
     assert_eq!(
         app.branch_base.winner.as_ref().map(herdr_reviewr::git::ResolvedBase::name),
@@ -9667,6 +9667,7 @@ fn quitting_with_unsent_comments_asks_first() {
         press(&mut app, &keymap, KeyCode::Char('q'));
         (r, app)
     };
+    let quitting = |app: &App| app.question == Some(herdr_reviewr::app::Question::Quit);
 
     // No comments: `q` quits at once, as it always has.
     let (_r, mut app) = fresh();
@@ -9676,7 +9677,7 @@ fn quitting_with_unsent_comments_asks_first() {
     // Unsent comments: `q` asks instead, and the footer is the question.
     let (_r, mut app) = asking();
     assert!(!app.should_quit, "the first `q` never drops comments");
-    assert!(app.confirming_quit);
+    assert!(quitting(&app));
     assert_eq!(
         app.footer_bands(),
         [
@@ -9690,28 +9691,28 @@ fn quitting_with_unsent_comments_asks_first() {
     // A repeated `q` never answers; `Q` quits.
     press(&mut app, &keymap, KeyCode::Char('q'));
     press(&mut app, &keymap, KeyCode::Char('q'));
-    assert!(app.confirming_quit && !app.should_quit, "`q` never answers its own question");
+    assert!(quitting(&app) && !app.should_quit, "`q` never answers its own question");
     press(&mut app, &keymap, KeyCode::Char('Q'));
     assert!(app.should_quit);
 
     // `Q` outside the question does nothing.
     let (_r, mut app) = commented();
     press(&mut app, &keymap, KeyCode::Char('Q'));
-    assert!(!app.should_quit && !app.confirming_quit);
+    assert!(!app.should_quit && !quitting(&app));
 
     // `esc` stays, and so does any other key, which does nothing else.
     for code in [KeyCode::Esc, KeyCode::Char('j'), KeyCode::Char('c')] {
         let (_r, mut app) = asking();
         let cursor = app.diff_cursor;
         press(&mut app, &keymap, code);
-        assert!(!app.confirming_quit, "{code:?} answers the question");
+        assert!(!quitting(&app), "{code:?} answers the question");
         assert!(!app.should_quit, "{code:?}");
         assert!(!app.composing(), "{code:?} only answers");
         assert_eq!(app.diff_cursor, cursor, "{code:?} only answers");
         assert_eq!(app.store.len(), 1, "{code:?}");
         // The answer is final: the next `q` asks again.
         press(&mut app, &keymap, KeyCode::Char('q'));
-        assert!(!app.should_quit && app.confirming_quit, "{code:?}");
+        assert!(!app.should_quit && quitting(&app), "{code:?}");
     }
 
     // `send` answers too (tests/send_flow.rs); `copy` would write the real clipboard.
@@ -9724,27 +9725,32 @@ fn quitting_with_unsent_comments_asks_first() {
         MouseEventKind::Up(MouseButton::Left),
     ] {
         mouse(&mut app, &keymap, kind);
-        assert!(app.confirming_quit, "{kind:?} leaves the question open");
+        assert!(quitting(&app), "{kind:?} leaves the question open");
     }
     for kind in [MouseEventKind::Down(MouseButton::Left), MouseEventKind::ScrollDown] {
         let (_r, mut app) = asking();
         let (cursor, scroll) = (app.diff_cursor, app.diff_scroll);
         mouse(&mut app, &keymap, kind);
-        assert!(!app.confirming_quit && !app.should_quit, "{kind:?}");
+        assert!(!quitting(&app) && !app.should_quit, "{kind:?}");
         assert_eq!((app.diff_cursor, app.diff_scroll), (cursor, scroll), "{kind:?} only answers");
     }
+
+    // A paste is input like a key: it answers, and lands nowhere.
+    let (_r, mut app) = asking();
+    app.input_paste("q");
+    assert!(!quitting(&app) && !app.should_quit && !app.composing());
 
     // A poll is no answer: the question stays open across it.
     let (r, mut app) = asking();
     r.write("a.rs", "alpha\nBETA\ngamma\ndelta\nepsilon\nzeta\n");
     app.reload().unwrap();
-    assert!(app.confirming_quit && !app.should_quit);
+    assert!(quitting(&app) && !app.should_quit);
 
     // The PR tab asks the same way, and takes the same answers.
     let (_r, mut app) = commented();
     press(&mut app, &keymap, KeyCode::Char('3'));
     press(&mut app, &keymap, KeyCode::Char('q'));
-    assert!(app.confirming_quit && !app.should_quit);
+    assert!(quitting(&app) && !app.should_quit);
     press(&mut app, &keymap, KeyCode::Char('Q'));
     assert!(app.should_quit);
 
@@ -9753,7 +9759,7 @@ fn quitting_with_unsent_comments_asks_first() {
     press(&mut app, &keymap, KeyCode::Char('l'));
     assert_eq!(app.mode, Mode::List);
     press(&mut app, &keymap, KeyCode::Char('q'));
-    assert!(!app.confirming_quit && !app.should_quit);
+    assert!(!quitting(&app) && !app.should_quit);
 }
 
 // --- Diff sides from git ----------------------------------------------

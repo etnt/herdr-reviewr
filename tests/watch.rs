@@ -273,31 +273,6 @@ fn git_noise_and_other_worktrees_report_nothing() {
 }
 
 #[test]
-fn a_worktree_coming_or_going_reports_itself_and_moves_no_view() {
-    let r = repo_with(&["a.txt"]);
-    let w = Watched::start(&r);
-    let has = |b: &Batch| b.git.contains(&GitChange::Worktrees);
-
-    // The first one makes `worktrees/` itself, the second an entry inside it.
-    let first = r.add_worktree("first");
-    assert!(has(&w.next()), "the first worktree added");
-    let second = r.add_worktree("second");
-    assert!(has(&w.next()), "a second worktree added");
-
-    std::fs::write(second.path().join("b.txt"), "x\n").unwrap();
-    std::process::Command::new("git")
-        .args(["-C", second.path().to_str().unwrap(), "add", "b.txt"])
-        .output()
-        .unwrap();
-    assert!(!has(&w.next()), "a sibling's stage is no worktree coming or going");
-
-    r.git(&["worktree", "remove", "--force", second.path().to_str().unwrap()]);
-    assert!(has(&w.next()), "a worktree removed");
-    r.git(&["worktree", "remove", first.path().to_str().unwrap()]);
-    assert!(has(&w.next()), "the last worktree removed");
-}
-
-#[test]
 fn reviewrs_own_ref_write_is_quiet_and_another_panes_is_not() {
     let r = repo_with(&["a.txt"]);
     let w = Watched::start(&r);

@@ -369,9 +369,10 @@ fn send_dispatches_one_agent_directly_and_several_through_the_picker() {
             press(&mut app, KeyCode::Char(tab), area, &keymap);
         }
         press(&mut app, KeyCode::Char('q'), area, &keymap);
-        assert!(app.confirming_quit && !app.should_quit, "unsent comments make `q` ask: {tab}");
+        let asked = app.question == Some(herdr_reviewr::app::Question::Quit);
+        assert!(asked && !app.should_quit, "unsent comments make `q` ask: {tab}");
         press(&mut app, KeyCode::Char('s'), area, &keymap);
-        assert!(!app.confirming_quit && !app.should_quit, "{tab}");
+        assert!(app.question.is_none() && !app.should_quit, "{tab}");
         assert!(app.store.is_empty(), "the answer sent them: {tab}");
         assert_eq!(app.status, "sent 1 comment to claude", "{tab}");
     }

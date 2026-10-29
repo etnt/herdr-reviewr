@@ -378,9 +378,9 @@ fn herdr_on_thread(args: Vec<String>) -> mpsc::Receiver<Result<String, HerdrErro
     rx
 }
 
-/// The socket and pane id the herdr connection needs; `None` outside herdr.
-pub fn connection_target() -> Option<(OsString, String)> {
-    Some((var_os("HERDR_SOCKET_PATH")?, var("HERDR_PANE_ID")?))
+/// The socket the herdr connection dials; `None` outside herdr.
+pub fn socket_path() -> Option<OsString> {
+    var_os("HERDR_SOCKET_PATH")
 }
 
 /// This pane's (workspace, pane) ids: the environment's at launch, then what the herdr
@@ -553,8 +553,15 @@ pub struct AgentSample {
 pub(crate) struct Sampled {
     /// The real agents other than our own pane, each by its pane.
     pub agents: Vec<(String, AgentSample)>,
-    /// The cwd of each entry herdr shaped unexpectedly, which may be an agent.
-    pub odd: Vec<Option<String>>,
+    /// Each entry herdr shaped unexpectedly, which may be an agent.
+    pub odd: Vec<OddEntry>,
+}
+
+/// An entry herdr shaped unexpectedly: the place it names, as far as it reads.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OddEntry {
+    pub cwd: Option<String>,
+    pub workspace: Option<String>,
 }
 
 /// Read a session snapshot's agent list; our own pane `me` is left out.
@@ -569,7 +576,11 @@ pub(crate) fn samples_of(agents: &serde_json::Value, me: Option<&str>) -> Option
             Err(_)
                 if matches!(&entry["agent"], serde_json::Value::Null)
                     || entry["agent"].as_str() == Some("") => {}
-            Err(_) => odd.push(entry["cwd"].as_str().filter(|c| !c.is_empty()).map(str::to_string)),
+            Err(_) => {
+                let text =
+                    |key: &str| entry[key].as_str().filter(|v| !v.is_empty()).map(Into::into);
+                odd.push(OddEntry { cwd: text("cwd"), workspace: text("workspace_id") });
+            }
         }
     }
     Some(Sampled { agents: samples_among(readable, me), odd })
@@ -963,12 +974,20 @@ mod tests {
             {"pane_id": "w2:p1", "agent": "codex", "tab_id": null, "cwd": "/elsewhere"},
             {"pane_id": "w2:p2", "agent": "codex"},
             {"pane_id": "w2:p3", "tab_id": null, "cwd": "/w"},
-            {"pane_id": "w2:p4", "agent": {"name": "codex"}, "cwd": "/reshaped"},
+            {"pane_id": "w2:p4", "agent": {"name": "codex"}, "cwd": "/reshaped", "workspace_id": "w2"},
             {"pane_id": "w1:p9", "agent": "claude", "tab_id": null},
         ]);
         let sampled = super::samples_of(&list, Some("w1:p9")).expect("a list");
         assert_eq!(sampled.agents.len(), 1, "the readable agent still counts");
-        let odd = [Some("/elsewhere".to_string()), None, Some("/reshaped".to_string())];
+        let entry = |cwd: Option<&str>, workspace: Option<&str>| super::OddEntry {
+            cwd: cwd.map(str::to_string),
+            workspace: workspace.map(str::to_string),
+        };
+        let odd = [
+            entry(Some("/elsewhere"), None),
+            entry(None, None),
+            entry(Some("/reshaped"), Some("w2")),
+        ];
         assert_eq!(
             sampled.odd, odd,
             "a shell pane and our own pane are no agents, a reshaped one is"

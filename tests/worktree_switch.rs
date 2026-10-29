@@ -55,13 +55,15 @@ fn clone_with_worktrees() -> (Repo, common::LinkedWorktree, common::LinkedWorktr
 
 /// Where the pane will restart, as the OS spells it (macOS temp dirs sit under `/private`).
 fn switch_target(app: &App) -> Option<std::path::PathBuf> {
-    app.switch_to.as_ref().map(|choice| canonical(&choice.path))
+    app.switch_to.as_deref().map(canonical)
 }
 
 /// The pane restarted on `path`, loaded as the run loop loads it.
 fn switch_to(old: &mut App, path: &std::path::Path) -> App {
-    let cfg = Config::parse([path.to_string_lossy().into_owned()]);
-    let mut switched = switched_app(&cfg, old);
+    let mut cfg = Config::parse([old.repo.to_string_lossy().into_owned()]);
+    old.switch_to = Some(path.to_path_buf());
+    let mut switched = switched_app(&mut cfg, old).expect("a switch was asked");
+    assert_eq!(cfg.repo, path, "the config follows the pick, so a recovery rebuilds there");
     switched.reload().unwrap();
     switched
 }
@@ -190,30 +192,83 @@ fn a_worktree_removed_after_listing_is_gone_not_switched_to() {
 }
 
 #[test]
-fn w_is_silent_and_unadvertised_without_another_worktree() {
+fn w_opens_on_a_lone_worktree_and_is_silent_outside_a_repo() {
     let repo = Repo::init();
     repo.write("main.txt", "base\n");
     repo.commit_all("base");
     let mut app = app_on(&repo);
     let advertised =
         |app: &App| app.footer_bands().iter().any(|(a, _)| *a == FooterAction::WorktreePick);
-    assert!(!advertised(&app));
+    assert!(advertised(&app), "like the commit picker, `W` shows on every tab");
+    app.set_tab(Tab::Pr).unwrap();
+    assert!(advertised(&app), "`W` works on `PR`, so its footer says so");
+    app.set_tab(Tab::Changes).unwrap();
+    let rows = |app: &App| -> Vec<_> {
+        let wp = app.worktree_picker.as_ref().expect("the picker is open");
+        wp.rows.iter().map(|r| (canonical(&r.path), r.current)).collect()
+    };
     press(&mut app, KeyCode::Char('W'));
-    assert_eq!(app.mode, Mode::Normal, "nothing to switch to: the key stays silent");
+    assert_eq!(rows(&app), [(canonical(repo.path()), true)], "the one worktree, current");
+    press(&mut app, KeyCode::Enter);
+    assert_eq!((app.mode.clone(), app.switch_to.clone()), (Mode::Normal, None));
 
-    // A new worktree shows the key once the watcher reports it (`tests/watch.rs`).
+    // A deleted, unpruned worktree is nothing to switch to.
     let wt = repo.add_worktree("other");
-    assert!(!advertised(&app), "listed once, at the first reload");
-    app.relist_worktrees();
-    assert!(advertised(&app));
-
-    // One deleted but never pruned touches nothing the watcher sees; `W` finds nothing to list
-    // and the footer stops advertising it.
     std::fs::remove_dir_all(wt.path()).unwrap();
-    assert!(advertised(&app));
     press(&mut app, KeyCode::Char('W'));
-    assert_eq!(app.mode, Mode::Normal, "a prunable worktree is nothing to switch to");
-    assert!(!advertised(&app), "the fresh listing corrected the footer");
+    assert_eq!(rows(&app), [(canonical(repo.path()), true)], "the prunable one is left out");
+    press(&mut app, KeyCode::Esc);
+
+    // Outside a repo there is nothing to list, and nothing to say about it.
+    let plain = tempfile::tempdir().unwrap();
+    let mut app = App::new(plain.path().to_path_buf(), Scope::Uncommitted, None);
+    app.reload().unwrap();
+    press(&mut app, KeyCode::Char('W'));
+    assert_eq!((app.mode.clone(), app.status.as_str()), (Mode::Normal, ""));
+}
+
+#[test]
+fn a_main_worktree_git_lists_by_its_git_dir_reads_as_itself() {
+    // `--separate-git-dir`, a submodule and a symlinked `.git` list their main worktree as the git dir.
+    let layouts: &[bool] = if cfg!(unix) { &[false, true] } else { &[false] };
+    for &symlinked in layouts {
+        let repo = Repo::init();
+        let (work, gd) = (repo.path().join("work"), repo.path().join("work.git"));
+        let (work_s, gd_s) = (work.to_str().unwrap(), gd.to_str().unwrap());
+        repo.git(&["init", "-q", "-b", "main", "--separate-git-dir", gd_s, work_s]);
+        if symlinked {
+            std::fs::remove_file(work.join(".git")).unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&gd, work.join(".git")).unwrap();
+        }
+        repo.git(&["-C", work_s, "commit", "-q", "--allow-empty", "-m", "base"]);
+        let mut app = App::new(work.clone(), Scope::Uncommitted, None);
+        app.reload().unwrap();
+        press(&mut app, KeyCode::Char('W'));
+        let wp = app.worktree_picker.as_ref().expect("the picker is open");
+        let rows: Vec<_> = wp.rows.iter().map(|r| (canonical(&r.path), r.current)).collect();
+        assert_eq!(rows, [(canonical(&work), true)], "never the git dir, symlinked {symlinked}");
+        press(&mut app, KeyCode::Esc);
+
+        let linked = repo.path().join("linked");
+        let linked_s = linked.to_str().unwrap();
+        repo.git(&["-C", work_s, "worktree", "add", "-q", "-b", "linked", linked_s]);
+        press(&mut app, KeyCode::Char('W'));
+        let wp = app.worktree_picker.as_ref().expect("the linked worktree is listed");
+        let rows: Vec<_> = wp.rows.iter().map(|r| (canonical(&r.path), r.current)).collect();
+        let listed = [(canonical(&work), true), (canonical(&linked), false)];
+        assert_eq!(rows, listed, "symlinked {symlinked}");
+
+        // From the linked one, git can't place that git dir, but the pane opened there.
+        press(&mut app, KeyCode::Esc);
+        let mut away = switch_to(&mut app, &linked);
+        press(&mut away, KeyCode::Char('W'));
+        let wp = away.worktree_picker.as_ref().expect("home is listed");
+        let rows: Vec<_> =
+            wp.rows.iter().map(|r| (canonical(&r.path), r.current, r.home)).collect();
+        let listed = [(canonical(&linked), true, false), (canonical(&work), false, true)];
+        assert_eq!(rows, listed, "symlinked {symlinked}");
+    }
 }
 
 #[test]

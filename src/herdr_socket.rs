@@ -87,6 +87,8 @@ impl Connection {
         let (me, rx) = mpsc::channel();
         let queue = me.clone();
         std::thread::Builder::new().name("herdr".into()).spawn(move || {
+            // Turn snapshots run git on `repo`.
+            let _session = crate::git::lease_session(&repo);
             let mut thread = Thread {
                 socket,
                 pane_id,
@@ -121,11 +123,11 @@ impl Drop for Connection {
     }
 }
 
-/// One agent pane as sampled, and whether its status came from an event on the live
-/// subscription, which no snapshot read after it can be newer than.
+/// One agent pane as sampled.
 #[derive(Clone, Debug)]
 struct Agent {
     sample: AgentSample,
+    /// Its status came from a live event, which no snapshot read after it can be newer than.
     heard: bool,
 }
 

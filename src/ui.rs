@@ -14,7 +14,7 @@ use ratatui::widgets::{
 use unicode_truncate::UnicodeTruncateStr;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Band, Focus, FooterAction, Mode, Tab};
+use crate::app::{App, Band, Focus, FooterAction, Mode, Question, Tab};
 use crate::config::NavigatorPosition;
 use crate::diff::{FileDiff, MarkerKind, Notice, RenderedKind, Row};
 use crate::file_list::RowKind;
@@ -54,7 +54,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     if let Some(error) = app.config_error() {
         let mut message =
             format!("{error}\n\nFix the file to continue. The config reloads automatically.");
-        if app.confirming_quit {
+        if app.question == Some(Question::Quit) {
             // The blocked screen reads the default bindings, as its key handling does.
             let key = crate::keymap::default_keymap().hint(crate::keymap::Action::QuitDiscard);
             let (n, key) = (app.unsent(), key.label());
@@ -2696,6 +2696,21 @@ mod tests {
             ("unread, cut", "herdr-reviewr", None, 8, Some("…reviewr")),
             ("below the minimum", "herdr-reviewr", None, 5, None),
             ("a short name whole", "wt", Some("x"), 6, Some("wt · x")),
+            (
+                "a branch named as its folder, once",
+                "company-pages",
+                Some("company-pages"),
+                99,
+                Some("company-pages"),
+            ),
+            ("once, cut", "company-pages", Some("company-pages"), 8, Some("…y-pages")),
+            (
+                "only an exact match",
+                "company-pages",
+                Some("Company-pages"),
+                99,
+                Some("company-pages · Company-pages"),
+            ),
             ("nothing to name", "", None, 99, None),
         ];
         for (name, folder, checkout, room, expected) in rows {
@@ -3084,9 +3099,9 @@ fn footer_row1(app: &App, w: usize) -> (Vec<Span<'static>>, Vec<FooterAction>) {
     // After a lone `?`, the row's first entry takes the separator the others carry.
     let lead_sep = show_more && !labeled;
 
-    // The `PR` tab leads with its state, unless the quit question owns the row.
+    // The `PR` tab leads with its state, unless a question owns the row.
     let pr_state =
-        (app.tab == Tab::Pr && !app.confirming_quit).then(|| app.pr_snapshot()).flatten();
+        (app.tab == Tab::Pr && app.question.is_none()).then(|| app.pr_snapshot()).flatten();
     if let Some(s) = pr_state {
         if lead_sep {
             spans.push(Span::styled(SEP, Style::default().fg(p.mark(Ink::Border, Fill::Bar))));
@@ -3133,15 +3148,12 @@ fn footer_row1(app: &App, w: usize) -> (Vec<Span<'static>>, Vec<FooterAction>) {
     // The status outranks the actions, which `?` repeats; it reserves only the room it can use.
     let ellipsis_room = if show_more || do_acts.is_empty() { 0 } else { MORE_ELLIPSIS };
     let free = w.saturating_sub(used + send_w + ellipsis_room);
-    let status_w = if app.status.is_empty()
-        || app.confirming_quit
-        || app.switch_question().is_some()
-        || free < STATUS_FRAME + STATUS_MIN
-    {
-        0
-    } else {
-        (STATUS_FRAME + app.status.width()).min(free)
-    };
+    let status_w =
+        if app.status.is_empty() || app.question.is_some() || free < STATUS_FRAME + STATUS_MIN {
+            0
+        } else {
+            (STATUS_FRAME + app.status.width()).min(free)
+        };
 
     // The worktree name outranks actions `?` repeats; a modal's own actions outrank it.
     let (folder, checkout) = app.worktree_name();
@@ -3202,8 +3214,7 @@ fn footer_row1(app: &App, w: usize) -> (Vec<Span<'static>>, Vec<FooterAction>) {
     (spans, overflow)
 }
 
-/// The footer's `folder · branch` within `room`: the folder gives way down to its `…`, then the
-/// branch stands alone, cut from its head last; `None` when not even that fits.
+/// The footer's `folder · branch` in `room`, folder cut first; `None` if empty or too long under `WORKTREE_MIN`.
 fn fit_worktree(folder: &str, checkout: Option<&str>, room: usize) -> Option<String> {
     let alone = |name: &str| {
         if name.width() <= room {
@@ -3212,7 +3223,8 @@ fn fit_worktree(folder: &str, checkout: Option<&str>, room: usize) -> Option<Str
             (room >= WORKTREE_MIN).then(|| cut_head(name, room))
         }
     };
-    let Some(branch) = checkout else { return alone(folder) };
+    // A branch named as its folder reads once.
+    let Some(branch) = checkout.filter(|b| *b != folder) else { return alone(folder) };
     let tail = format!("{SEP}{branch}");
     if folder.is_empty() || room <= tail.width() {
         return alone(branch);

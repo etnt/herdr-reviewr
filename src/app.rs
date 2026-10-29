@@ -102,6 +102,8 @@ struct TabStash {
     cursor_line: Option<(usize, usize)>,
     comment_target: Option<u64>,
     rendered: RenderedView,
+    /// The checkout this tab's list was built from, which the footer names beside it.
+    checkout: Option<String>,
     /// Whether this tab ever loaded; a first visit loads before the frame.
     visited: bool,
 }
@@ -247,8 +249,15 @@ pub struct WorktreePicker {
     pub query: String,
     /// The caret in `query`, a char index.
     pub caret: usize,
-    /// The pick waiting on the switch question while comments are unsent.
-    pub confirming: Option<WorktreeChoice>,
+}
+
+/// A question unsent comments raise; the next input answers it, and until then it owns the footer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Question {
+    /// Quit and lose them (#119).
+    Quit,
+    /// Switch to this worktree and lose them, over the picker it was picked in.
+    Switch(WorktreeChoice),
 }
 
 impl WorktreePicker {
@@ -782,18 +791,16 @@ pub struct App {
     /// Whether the `?` list is open, on every tab.
     pub keys_expanded: bool,
     pub should_quit: bool,
-    /// Quit pressed with unsent comments; the next input answers (#119). Beside [`Mode`], not one.
-    pub confirming_quit: bool,
+    /// The question the next input answers. Beside [`Mode`], not one: it asks over any mode.
+    pub question: Option<Question>,
     /// The worktree this pane restarts on when the frame loop next returns.
-    pub switch_to: Option<WorktreeChoice>,
-    /// This clone's git common dir, asked of git once; `None` outside a repo.
-    common_dir: std::cell::OnceCell<Option<PathBuf>>,
-    /// Whether the last listing held another worktree to switch to; `None` until first listed.
-    other_worktrees: Option<bool>,
+    pub switch_to: Option<PathBuf>,
     /// The worktree this pane opened on, kept across switches.
     pub home: PathBuf,
-    /// What the worktree on screen has checked out, as the last world build read it.
+    /// The checkout the active file tab's list was built from.
     checkout: Option<String>,
+    /// The checkout the latest full build read, which `PR` names, as it leaves the file tabs frozen.
+    read_checkout: Option<String>,
     /// The read-only `PR` tab's view of the pull request.
     pub pr: forge::PrView,
     /// The resolved target's forge, which picks the display noun.
@@ -986,11 +993,10 @@ impl App {
             status: String::new(),
             keys_expanded: false,
             should_quit: false,
-            confirming_quit: false,
+            question: None,
             switch_to: None,
-            common_dir: std::cell::OnceCell::new(),
-            other_worktrees: None,
             checkout: None,
+            read_checkout: None,
             pr: forge::PrView::Pending,
             pr_forge: crate::git::Forge::GitHub,
             pr_notice: None,
@@ -1099,7 +1105,7 @@ impl App {
     }
 
     /// Carry the pane's own state: where it opened, the footer expansion, the navigator and splits.
-    fn carry_layout_from(&mut self, old: &Self) {
+    fn carry_pane_from(&mut self, old: &Self) {
         self.home.clone_from(&old.home);
         self.keys_expanded = old.keys_expanded;
         self.navigator_side_pct = old.navigator_side_pct;
@@ -1116,7 +1122,7 @@ impl App {
 
     /// Carry how the pane views, never what it reviews, into a pane switched to another worktree.
     pub fn carry_view_from(&mut self, old: &mut Self) {
-        self.carry_layout_from(old);
+        self.carry_pane_from(old);
         self.wrap = old.wrap;
         self.markdown_rendered = old.markdown_rendered;
         // A commit pick names the old worktree's commits, so its scope stays behind.
@@ -1124,18 +1130,16 @@ impl App {
             self.scope = old.scope;
         }
         // What herdr said of the pane carries; what it said of the old worktree does not.
-        let pane =
-            std::mem::replace(&mut old.herdr, HerdrView::new(crate::turn::LastTurn::default()));
-        let fresh = std::mem::replace(&mut self.herdr, pane);
-        self.herdr.last_turn = fresh.last_turn;
-        self.herdr.agents_present = fresh.agents_present;
+        self.herdr.ids = std::mem::take(&mut old.herdr.ids);
+        self.herdr.on_screen = old.herdr.on_screen;
+        self.herdr.too_old = old.herdr.too_old;
     }
 
     /// Carry the review into a recovered app: comments, and a draft with its frozen diff.
     pub(crate) fn carry_authored_state_from(&mut self, old: &mut Self) {
         self.store = std::mem::take(&mut old.store);
         self.list_cursor = old.list_cursor;
-        self.carry_layout_from(old);
+        self.carry_pane_from(old);
         // Session memory, like the comments.
         self.last_sent_pane = old.last_sent_pane.take();
         // The commit pick is session memory like the comments: replaced, never cleared
@@ -1292,13 +1296,10 @@ impl App {
     /// Build and reconcile synchronously; never touches comments or the draft.
     pub fn reload(&mut self) -> Result<()> {
         self.ensure_config_ready()?;
-        // Listed once here; the watcher reports worktrees coming and going after that.
-        if self.other_worktrees.is_none() {
-            self.relist_worktrees();
-        }
         // Outside a git repo, a file tab shows an empty state rather than failing.
         if self.tab.is_file_tab() && !git::is_repo(&self.repo) {
             self.checkout = None;
+            self.read_checkout = None;
             self.entries.clear();
             self.changeset = Changeset::default();
             self.file_rows.clear();
@@ -1347,14 +1348,17 @@ impl App {
         }
     }
 
-    /// Reconcile a snapshot into the view: identity, then fallback, then clamp (Continuity).
-    pub fn reconcile_world(&mut self, snapshot: crate::world::WorldSnapshot) {
-        // The footer names the checkout this build read, in the frame its diff lands in.
-        self.checkout = snapshot.checkout;
-        // `PR` leaves the file tabs frozen; a file tab reloads on return.
-        if !self.tab.is_file_tab() {
-            return;
+    /// Reconcile a snapshot into the view (Continuity); whether the file view took it, as `PR` never does.
+    pub fn reconcile_world(&mut self, snapshot: crate::world::WorldSnapshot) -> bool {
+        // A path-limited build carries its checkout rather than reading it.
+        if snapshot.touched.is_none() {
+            self.read_checkout.clone_from(&snapshot.checkout);
         }
+        if !self.tab.is_file_tab() {
+            return false;
+        }
+        // The footer names the checkout this build read, in the frame its list lands in.
+        self.checkout = snapshot.checkout;
         // The cursor keeps its target, else the open file, else the first file.
         let anchor = self.cursor_anchor();
         let open = self.diff_path.clone();
@@ -1402,6 +1406,7 @@ impl App {
         }
         self.refresh_commit_picker(snapshot.head.as_deref());
         self.tab_visited = true;
+        true
     }
 
     /// The text of the read-pane row the multi-click chain targets.
@@ -3032,6 +3037,7 @@ impl App {
         std::mem::swap(&mut self.select_anchor, &mut self.stash.select_anchor);
         std::mem::swap(&mut self.rendered, &mut self.stash.rendered);
         std::mem::swap(&mut self.comment_target, &mut self.stash.comment_target);
+        std::mem::swap(&mut self.checkout, &mut self.stash.checkout);
         std::mem::swap(&mut self.tab_visited, &mut self.stash.visited);
     }
 
@@ -3708,7 +3714,7 @@ impl App {
         if changed && self.mode == Mode::BasePick {
             self.refilter_base_picker(highlighted);
         }
-        // A filter edit puts the highlight on the best match.
+        // The worktree picker opens on the current row, a no-op, so unlike the base picker's its filter takes the best match.
         if changed
             && self.mode == Mode::WorktreePick
             && let Some(wp) = self.worktree_picker.as_mut()
@@ -3811,9 +3817,8 @@ impl App {
             self.paste_line(text);
             return;
         }
-        // A paste answers the switch question as a stray key does: back to the picker, unapplied.
-        if self.switch_question().is_some() {
-            self.cancel_switch_question();
+        // A paste answers a question as a stray key does: it stays, the paste unapplied.
+        if self.question.take().is_some() {
             return;
         }
         let mut norm = text.replace("\r\n", "\n").replace('\r', "\n");
@@ -4697,8 +4702,25 @@ impl App {
         use FooterAction as A;
 
         // A modal owns the bar, its exit right after the primary so trims spare it.
-        if self.confirming_quit {
-            return vec![(A::QuitDiscard, Primary), (A::Cancel, Do), (A::Send, Do), (A::Copy, Do)];
+        match self.question {
+            Some(Question::Quit) => {
+                return vec![
+                    (A::QuitDiscard, Primary),
+                    (A::Cancel, Do),
+                    (A::Send, Do),
+                    (A::Copy, Do),
+                ];
+            }
+            // The switch question mirrors quit's.
+            Some(Question::Switch(_)) => {
+                return vec![
+                    (A::SwitchDiscard, Primary),
+                    (A::Cancel, Do),
+                    (A::Send, Do),
+                    (A::Copy, Do),
+                ];
+            }
+            None => {}
         }
         match self.mode {
             Mode::Composing { .. } => {
@@ -4718,15 +4740,6 @@ impl App {
             }
             Mode::BasePick => {
                 return vec![(A::PickBaseRow, Primary), (A::ClosePicker, Do), (A::MoveMenuRow, Do)];
-            }
-            // The switch question mirrors quit's.
-            Mode::WorktreePick if self.switch_question().is_some() => {
-                return vec![
-                    (A::SwitchDiscard, Primary),
-                    (A::Cancel, Do),
-                    (A::Send, Do),
-                    (A::Copy, Do),
-                ];
             }
             Mode::WorktreePick => {
                 return vec![
@@ -4794,6 +4807,7 @@ impl App {
             if self.pr_snapshot().is_some() {
                 out.push((A::OpenPr, Primary));
             }
+            out.push((A::WorktreePick, Go));
             out.push((A::Search, Go));
             out.push((A::TogglePane, Go));
             out.push((A::NavigatorPosition, Go));
@@ -4897,10 +4911,7 @@ impl App {
         if !out.iter().any(|&(a, _)| a == A::CommitPick) {
             out.push((A::CommitPick, Go));
         }
-        // The worktree picker's key shows only where there is another worktree to switch to.
-        if self.has_other_worktrees() {
-            out.push((A::WorktreePick, Go));
-        }
+        out.push((A::WorktreePick, Go));
         out.push((A::Search, Go));
         // In-file find shows wherever the read pane has content to search.
         if self.find_available() {
@@ -5085,51 +5096,39 @@ impl App {
         self.mode = Mode::BasePick;
     }
 
-    /// Whether this clone has another worktree to switch to, as the picker would list it.
-    pub fn has_other_worktrees(&self) -> bool {
-        self.other_worktrees == Some(true)
-    }
-
-    /// The worktree on screen, for the footer: its folder, and its checkout once a build read it.
+    /// The worktree on screen, for the footer: its folder, and the checkout of what is on screen.
     pub fn worktree_name(&self) -> (String, Option<&str>) {
         let folder = self.repo.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        (folder, self.checkout.as_deref())
-    }
-
-    /// List this clone's worktrees again for the footer, as the picker would list them.
-    pub fn relist_worktrees(&mut self) {
-        let others = self.worktree_rows().is_ok_and(|rows| rows.iter().any(|r| !r.current));
-        self.other_worktrees = Some(others);
+        let checkout = match self.tab {
+            Tab::Pr => self.read_checkout.as_ref(),
+            Tab::Changes | Tab::AllFiles => self.checkout.as_ref(),
+        };
+        (folder, checkout.map(String::as_str))
     }
 
     /// This clone's worktrees as picker rows, listed from the common dir, which outlives any one.
     fn worktree_rows(&self) -> Result<Vec<WorktreeChoice>, git::GitFail> {
+        // Outside a repo there is nothing to list.
+        let Some((_, common)) = git::git_dirs(&self.repo) else { return Ok(Vec::new()) };
         let here = git::canonical(&self.repo);
         let home = git::canonical(&self.home);
-        let common = self.common_dir.get_or_init(|| git::git_dirs(&self.repo).map(|(_, c)| c));
-        let listed = git::worktrees(common.as_deref().unwrap_or(&self.repo))?;
+        let listed = git::worktrees(&common, &[&self.repo, &self.home])?;
         Ok(listed
             .into_iter()
             .map(|c| {
-                let name = c.branch.unwrap_or_else(|| {
-                    format!(
-                        "detached {}",
-                        c.head.as_deref().map(git::abbreviate_oid).unwrap_or_default()
-                    )
-                });
                 let at = git::canonical(&c.path);
                 WorktreeChoice {
                     current: at == here,
                     home: at == home,
                     shown_path: home_relative(&c.path),
+                    name: git::checkout_name(c.branch, c.head.as_deref()).unwrap_or_default(),
                     path: c.path,
-                    name,
                 }
             })
             .collect())
     }
 
-    /// Open the worktree picker on the current worktree; with nothing to switch to, stay silent.
+    /// Open the worktree picker on the current worktree; outside a repo, stay silent.
     pub fn open_worktree_picker(&mut self) {
         if self.mode != Mode::Normal {
             return;
@@ -5141,46 +5140,58 @@ impl App {
                 return;
             }
         };
-        // A fresh listing also corrects the footer, which no watcher event may have reached.
-        self.other_worktrees = Some(rows.iter().any(|r| !r.current));
-        if self.other_worktrees == Some(false) {
+        if rows.is_empty() {
             return;
         }
         rows.sort_by(|a, b| {
             (b.current, b.home).cmp(&(a.current, a.home)).then_with(|| a.name.cmp(&b.name))
         });
-        self.worktree_picker = Some(WorktreePicker {
-            rows,
-            cursor: 0,
-            query: String::new(),
-            caret: 0,
-            confirming: None,
-        });
+        self.worktree_picker =
+            Some(WorktreePicker { rows, cursor: 0, query: String::new(), caret: 0 });
         self.mode = Mode::WorktreePick;
     }
 
+    /// Close the picker, and the switch question asked over it.
     pub fn close_worktree_picker(&mut self) {
         if self.mode == Mode::WorktreePick {
             self.mode = Mode::Normal;
         }
         self.worktree_picker = None;
-    }
-
-    /// Move the highlight through the visible view.
-    pub fn worktree_picker_move(&mut self, delta: isize) {
-        let Some(wp) = self.worktree_picker.as_mut() else { return };
-        let len = wp.visible().len();
-        if len > 0 {
-            wp.cursor = step(wp.cursor.min(len - 1), delta, len);
+        if matches!(self.question, Some(Question::Switch(_))) {
+            self.question = None;
         }
     }
 
-    /// Move the highlight to visible `row`, for a click. A row past the end is inert.
-    pub fn worktree_picker_goto(&mut self, row: usize) {
-        if let Some(wp) = self.worktree_picker.as_mut()
-            && row < wp.visible().len()
+    /// The open base or worktree picker's highlight, and how many rows its filter shows.
+    fn filter_highlight(&mut self) -> Option<(&mut usize, usize)> {
+        match self.mode {
+            Mode::BasePick => self.base_picker.as_mut().map(|p| {
+                let len = p.visible().len();
+                (&mut p.cursor, len)
+            }),
+            Mode::WorktreePick => self.worktree_picker.as_mut().map(|p| {
+                let len = p.visible().len();
+                (&mut p.cursor, len)
+            }),
+            _ => None,
+        }
+    }
+
+    /// Move the base or worktree picker's highlight through the visible view.
+    pub fn filter_picker_move(&mut self, delta: isize) {
+        if let Some((cursor, len)) = self.filter_highlight()
+            && len > 0
         {
-            wp.cursor = row;
+            *cursor = step((*cursor).min(len - 1), delta, len);
+        }
+    }
+
+    /// Move that highlight to visible `row`, for a click; a row past the end is inert.
+    pub fn filter_picker_goto(&mut self, row: usize) {
+        if let Some((cursor, len)) = self.filter_highlight()
+            && row < len
+        {
+            *cursor = row;
         }
     }
 
@@ -5191,9 +5202,7 @@ impl App {
         if choice.current {
             self.close_worktree_picker();
         } else if choice.path.is_dir() && self.unsent() > 0 {
-            if let Some(wp) = self.worktree_picker.as_mut() {
-                wp.confirming = Some(choice);
-            }
+            self.question = Some(Question::Switch(choice));
         } else {
             self.request_switch(choice);
         }
@@ -5203,7 +5212,7 @@ impl App {
     fn request_switch(&mut self, choice: WorktreeChoice) {
         self.close_worktree_picker();
         if choice.path.is_dir() {
-            self.switch_to = Some(choice);
+            self.switch_to = Some(choice.path);
         } else {
             self.status = format!("worktree gone: {}", choice.shown_path);
         }
@@ -5212,21 +5221,17 @@ impl App {
     /// The pick the switch question is asking about.
     #[must_use]
     pub fn switch_question(&self) -> Option<&WorktreeChoice> {
-        self.worktree_picker.as_ref()?.confirming.as_ref()
+        match &self.question {
+            Some(Question::Switch(choice)) => Some(choice),
+            _ => None,
+        }
     }
 
     /// Answer the switch question by switching and dropping the unsent comments.
     pub fn switch_discarding(&mut self) {
-        match self.worktree_picker.as_mut().and_then(|wp| wp.confirming.take()) {
-            Some(choice) => self.request_switch(choice),
-            None => self.close_worktree_picker(),
-        }
-    }
-
-    /// Answer the switch question by staying in the picker.
-    pub fn cancel_switch_question(&mut self) {
-        if let Some(wp) = self.worktree_picker.as_mut() {
-            wp.confirming = None;
+        match self.question.take() {
+            Some(Question::Switch(choice)) => self.request_switch(choice),
+            _ => self.close_worktree_picker(),
         }
     }
 
@@ -5235,24 +5240,6 @@ impl App {
             self.mode = Mode::Normal;
         }
         self.base_picker = None;
-    }
-
-    /// Move the highlight through the visible view.
-    pub fn base_picker_move(&mut self, delta: isize) {
-        let Some(bp) = self.base_picker.as_mut() else { return };
-        let len = bp.visible().len();
-        if len > 0 {
-            bp.cursor = step(bp.cursor.min(len - 1), delta, len);
-        }
-    }
-
-    /// Move the highlight to visible `row`, for a click. A row past the end is inert
-    pub fn base_picker_goto(&mut self, row: usize) {
-        if let Some(bp) = self.base_picker.as_mut()
-            && row < bp.visible().len()
-        {
-            bp.cursor = row;
-        }
     }
 
     /// Pick the highlight, or a resolving query, and rebuild; the default row clears the pick.
@@ -5487,7 +5474,7 @@ impl App {
         if self.unsent() == 0 {
             self.should_quit = true;
         } else {
-            self.confirming_quit = true;
+            self.question = Some(Question::Quit);
         }
     }
 
@@ -5500,7 +5487,7 @@ impl App {
 
     /// Whether the footer is the `Normal` bar with `?` and bands.
     pub fn footer_open_ended(&self) -> bool {
-        self.mode == Mode::Normal && !self.confirming_quit
+        self.mode == Mode::Normal && self.question.is_none()
     }
 
     /// The scope's changed-file count, on every tab.

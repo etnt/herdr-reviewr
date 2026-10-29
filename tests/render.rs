@@ -3428,8 +3428,7 @@ fn the_worktree_picker_paints_its_rows_and_clicks_land_on_them() {
     let pages = narrow.lines().find(|l| l.contains("company-pages")).expect("the other row");
     assert!(pages.contains('…'), "{narrow}");
 
-    // Switched away, the worktree the pane opened on reads `home`, under the current one and
-    // above a branch that sorts before it.
+    // Switched away, the pane's first worktree reads `home`, under the current one, over an earlier branch.
     let _alpha = r.add_worktree("alpha");
     let mut away = App::new(wt.path().to_path_buf(), Scope::Uncommitted, None);
     away.home = r.path().to_path_buf();
@@ -3501,6 +3500,19 @@ fn the_footer_names_the_worktree_at_its_right_edge() {
     let asking = footer_line(&render_at(&app, 120));
     assert!(asking.contains("(1 pending) · esc cancel"), "{asking}");
     assert!(asking.ends_with(&format!("  {folder} · main ")), "{asking}");
+
+    // The question owns its row on `PR` too, the PR's state line set aside as quit's is.
+    handle_key(&mut app, KeyEvent::from(KeyCode::Esc), AREA, &Keymap::default()).unwrap();
+    handle_key(&mut app, KeyEvent::from(KeyCode::Esc), AREA, &Keymap::default()).unwrap();
+    app.set_tab(Tab::Pr).unwrap();
+    app.pr = herdr_reviewr::forge::PrView::Pr(Box::new(common::pr_snapshot()));
+    app.open_worktree_picker();
+    for code in [KeyCode::Down, KeyCode::Enter] {
+        handle_key(&mut app, KeyEvent::from(code), AREA, &Keymap::default()).unwrap();
+    }
+    assert!(app.switch_question().is_some());
+    let on_pr = footer_line(&render_at(&app, 60));
+    assert!(on_pr.starts_with(" W switch"), "{on_pr}");
 
     // A branch with a `/` reads whole: the folder gives way before it.
     let r = Repo::init();
@@ -4843,7 +4855,7 @@ fn a_trimmed_modal_row_always_shows_its_ellipsis() {
             let whole = ["…", "y copy", "main"].iter().any(|last| row.ends_with(last));
             assert!(whole, "{n} at {w} overflows:\n{row}");
         }
-        app.confirming_quit = false;
+        app.question = None;
     }
 }
 
