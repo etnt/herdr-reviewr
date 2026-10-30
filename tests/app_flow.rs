@@ -8021,15 +8021,19 @@ fn a_poll_under_the_open_picker_reconciles_by_sha() {
 }
 
 #[test]
-fn a_resolved_base_lists_the_commits_over_its_merge_base() {
+fn the_picker_lists_recent_history_even_under_a_base() {
     let (r, shas) = commits_repo();
     r.set_origin_default("main", &shas[1]);
     let mut app = app_on(&r);
     let keymap = Keymap::default();
     press(&mut app, &keymap, KeyCode::Char('G'));
-    assert_eq!(picker(&app).title, "commits · 2 over main");
+    assert_eq!(picker(&app).title, "commits · last 50");
     let listed: Vec<&str> = picker(&app).rows.iter().map(|r| r.sha.as_str()).collect();
-    assert_eq!(listed, [shas[3].as_str(), shas[2].as_str()], "newest first, the base excluded");
+    assert_eq!(
+        listed,
+        [shas[3].as_str(), shas[2].as_str(), shas[1].as_str(), shas[0].as_str()],
+        "newest first, the base's older commits included"
+    );
 }
 
 #[test]

@@ -5324,23 +5324,13 @@ impl App {
         self.mode = Mode::CommitPick;
     }
 
-    /// The commit picker's rows and title, the last 50 without a merge-base.
+    /// The commit picker's rows and title: always the last 50 commits of `HEAD`, so older
+    /// history on the base branch stays reachable.
     fn list_commit_rows(&self) -> Result<CommitPicker, String> {
         let head = git::head_oid(&self.repo);
-        let base = git::resolve_base(&self.repo, self.base.as_deref())
-            .map_err(|e| e.0)?
-            .status
-            .winner
-            .and_then(|b| git::merge_base(&self.repo, b.oid()).map(|mb| (b, mb)))
-            // On the base branch itself the range is empty: the last 50 is the universe.
-            .filter(|(_, mb)| head.as_deref() != Some(mb.as_str()));
-        let rows = git::list_commits(&self.repo, base.as_ref().map(|(_, mb)| mb.as_str()))
-            .map_err(|e| e.to_string())?;
+        let rows = git::list_commits(&self.repo, None).map_err(|e| e.to_string())?;
         // Only an unborn repository lists nothing.
-        let title = match &base {
-            Some((b, _)) => format!("commits · {} over {}", rows.len(), b.name()),
-            None => "commits · last 50".to_string(),
-        };
+        let title = "commits · last 50".to_string();
         let empty = "no commits yet".to_string();
         Ok(CommitPicker {
             rows,
