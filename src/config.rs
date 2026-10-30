@@ -60,7 +60,7 @@ impl Config {
     }
 }
 
-const PLUGIN_CONFIG_KEYS: [&str; 15] = [
+const PLUGIN_CONFIG_KEYS: [&str; 16] = [
     "theme",
     "default_scope",
     "markdown_view",
@@ -76,6 +76,7 @@ const PLUGIN_CONFIG_KEYS: [&str; 15] = [
     "url_opener",
     "review_prefix",
     "keybindings",
+    "colors",
 ];
 
 /// How a fresh pane shows a markdown file: as source, or rendered.
@@ -186,6 +187,7 @@ pub struct PluginConfig {
     url_opener: Option<String>,
     review_prefix: Option<String>,
     keymap: crate::keymap::Keymap,
+    diff_colors: crate::roles::Overrides,
 }
 
 impl Default for PluginConfig {
@@ -206,6 +208,7 @@ impl Default for PluginConfig {
             url_opener: None,
             review_prefix: None,
             keymap: crate::keymap::Keymap::default(),
+            diff_colors: crate::roles::Overrides::default(),
         }
     }
 }
@@ -213,6 +216,11 @@ impl Default for PluginConfig {
 impl PluginConfig {
     pub fn theme(&self) -> &str {
         &self.theme
+    }
+
+    /// The diff's added and removed fills from `[colors]`, painted over the theme's own.
+    pub fn diff_colors(&self) -> crate::roles::Overrides {
+        self.diff_colors
     }
 
     /// A fresh pane's scope; a reread never switches a running one.
@@ -525,7 +533,51 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
     if let Some(value) = table.get("keybindings") {
         config.keymap = parse_keybindings(path, value)?;
     }
+    if let Some(value) = table.get("colors") {
+        config.diff_colors = parse_colors(path, value)?;
+    }
     Ok(config)
+}
+
+/// The `[colors]` table: each diff fill's `#rrggbb` color, and nothing else.
+fn parse_colors(
+    path: &Path,
+    value: &toml::Value,
+) -> Result<crate::roles::Overrides, PluginConfigError> {
+    use crate::roles::{Fill, Overrides};
+    const FILLS: [(&str, Fill); 4] = [
+        ("added", Fill::Added),
+        ("added_emph", Fill::AddedEmph),
+        ("removed", Fill::Removed),
+        ("removed_emph", Fill::RemovedEmph),
+    ];
+    let Some(entries) = value.as_table() else {
+        return Err(value_error(path, value, "colors", "a table of diff colors"));
+    };
+    let mut overrides = Overrides::default();
+    for (name, value) in entries {
+        let Some(&(_, fill)) = FILLS.iter().find(|(known, _)| known == name) else {
+            return Err(unknown_key_error(path, name, "added, added_emph, removed, removed_emph"));
+        };
+        overrides = overrides.fill(fill, hex_color(path, name, value)?);
+    }
+    Ok(overrides)
+}
+
+/// A `#rrggbb` color, six hex digits after the `#`.
+fn hex_color(
+    path: &Path,
+    key: &str,
+    value: &toml::Value,
+) -> Result<ratatui::style::Color, PluginConfigError> {
+    let expected = "a hex color like \"#7a2a35\"";
+    let bad = || value_error(path, value, key, expected);
+    let digits = string_value(path, key, value, expected)?
+        .strip_prefix('#')
+        .filter(|d| d.len() == 6)
+        .ok_or_else(bad)?;
+    let rgb = u32::from_str_radix(digits, 16).map_err(|_| bad())?;
+    Ok(ratatui::style::Color::Rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8))
 }
 
 /// One `[keybindings]` key: a one-cell character or a named key, optionally `ctrl+`/`alt+`.
@@ -875,6 +927,35 @@ mod tests {
         assert!(
             super::plugin_config_in(dir.path()).unwrap_err().to_string().contains("syntax error")
         );
+    }
+
+    #[test]
+    fn colors_table_sets_diff_fills_and_rejects_bad_values() {
+        use crate::roles::{Fill, Overrides};
+        use ratatui::style::Color;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[colors]\nremoved = \"#7a2a35\"\nadded_emph = \"#2E8B57\"\n")
+            .unwrap();
+        let colors = super::plugin_config_in(dir.path()).unwrap().diff_colors();
+        assert_eq!(
+            colors,
+            Overrides::default()
+                .fill(Fill::Removed, Color::Rgb(0x7a, 0x2a, 0x35))
+                .fill(Fill::AddedEmph, Color::Rgb(0x2e, 0x8b, 0x57))
+        );
+        let cases = [
+            ("[colors]\nremoved = \"red\"\n", "`removed`"),
+            ("[colors]\nremoved = 3\n", "`removed`"),
+            ("[colors]\nremoved = \"#7a2a3\"\n", "`removed`"),
+            ("[colors]\nbackground = \"#000000\"\n", "`background`"),
+            ("colors = \"red\"\n", "`colors`"),
+        ];
+        for (text, key) in cases {
+            std::fs::write(&path, text).unwrap();
+            let error = super::plugin_config_in(dir.path()).unwrap_err().to_string();
+            assert!(error.contains(key), "{text}: {error}");
+        }
     }
 
     #[test]

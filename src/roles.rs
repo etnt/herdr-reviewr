@@ -153,6 +153,17 @@ impl Overrides {
         self.fills[fill as usize] = Some(color);
         self
     }
+
+    /// `self` with every fill `other` sets taking precedence over its own.
+    #[must_use]
+    pub fn merged(mut self, other: Self) -> Self {
+        for (mine, theirs) in self.fills.iter_mut().zip(other.fills) {
+            if theirs.is_some() {
+                *mine = theirs;
+            }
+        }
+        self
+    }
 }
 
 /// Lowest contrast for text, WCAG AA.

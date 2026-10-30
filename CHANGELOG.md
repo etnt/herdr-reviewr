@@ -7,6 +7,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Diff colors**: a `[colors]` table in `config.toml` sets the added and removed backgrounds, `added`, `added_emph`, `removed`, and `removed_emph`, each a `#rrggbb` color. Unset keys keep the theme's colors.
 - **Type any revision in the commit picker**: `H` opens a rev field that takes a hash, a short
   hash, a tag, or `HEAD~2`, including commits the list doesn't show (say, one on another branch).
 - **Breaking: `H` is a new default key.** A `[keybindings]` config that already uses `H` now collides and must move it.

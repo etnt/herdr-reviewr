@@ -225,6 +225,16 @@ Light: `catppuccin-latte`, `gruvbox-light`, `one-light`, `solarized-light`, `git
 
 Pick one that matches your terminal's background. Shared names match herdr's colors.
 
+To change only the diff's added and removed backgrounds, set `[colors]` in `config.toml`. Each value is a `#rrggbb` color. A key you leave out keeps the theme's color:
+
+```toml
+[colors]
+removed = "#7a2a35"
+removed_emph = "#9c3a48"   # changed words inside a removed line
+added = "#1f3a2a"
+added_emph = "#30553f"     # changed words inside an added line
+```
+
 ### Markdown and diff view
 
 `m` and `|` stick for every file you open until you press them again. `markdown_view` and

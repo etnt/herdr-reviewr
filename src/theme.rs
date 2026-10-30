@@ -56,10 +56,15 @@ pub struct Theme {
 /// Resolve a theme name to a `Theme`. `None`, an unknown name, or a not-yet-supported
 /// one (including `terminal`) falls back to the default and logs; never a half-palette.
 pub fn resolve(name: Option<&str>) -> Theme {
+    resolve_with(name, Overrides::default())
+}
+
+/// [`resolve`], with `diff` painted over the theme's own added and removed fills.
+pub fn resolve_with(name: Option<&str>, diff: Overrides) -> Theme {
     let name = name.unwrap_or(DEFAULT);
-    build(name).unwrap_or_else(|| {
+    build(name, diff).unwrap_or_else(|| {
         logln!("unknown theme {name:?}; using {DEFAULT}");
-        build(DEFAULT).expect("the default theme is built in")
+        build(DEFAULT, diff).expect("the default theme is built in")
     })
 }
 
@@ -70,10 +75,11 @@ pub fn is_known(name: &str) -> bool {
 }
 
 /// The built theme for `name`, or `None` when it is not a known palette.
-fn build(name: &str) -> Option<Theme> {
+fn build(name: &str, diff: Overrides) -> Option<Theme> {
     let name = *NAMES.iter().find(|n| **n == name)?;
     let (syntax, primitives, fills) = entry(name)?;
-    Some(Theme { name, palette: Palette::derive(primitives, fills), syntax })
+    let palette = Palette::derive(primitives, fills.merged(diff));
+    Some(Theme { name, palette, syntax })
 }
 
 /// A theme's syntax pairing, primitives, and the fills it sets itself.
@@ -240,15 +246,25 @@ const fn hex(rgb: u32) -> Color {
 
 #[cfg(test)]
 mod tests {
-    use super::{NAMES, entry, resolve};
+    use super::{NAMES, entry, resolve, resolve_with};
     use crate::roles::{
-        Cast, FILL_SEP, FILLS, Fill, INK_SEP, INKS, Ink, LAYERS, MARK_FLOOR, TEXT_FLOOR, TIER_STEP,
-        contrast, oklab_distance,
+        Cast, FILL_SEP, FILLS, Fill, INK_SEP, INKS, Ink, LAYERS, MARK_FLOOR, Overrides, TEXT_FLOOR,
+        TIER_STEP, contrast, oklab_distance,
     };
     use ratatui::style::Color;
 
     fn rgb(hex: u32) -> Color {
         Color::Rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
+    }
+
+    #[test]
+    fn diff_colors_replace_only_the_fills_they_name() {
+        let mine = rgb(0x7a2a35);
+        let diff = Overrides::default().fill(Fill::Removed, mine);
+        let theme = resolve_with(Some("catppuccin"), diff).palette;
+        let plain = resolve(Some("catppuccin")).palette;
+        assert_eq!(theme.fill(Fill::Removed), mine);
+        assert_eq!(theme.fill(Fill::Added), plain.fill(Fill::Added));
     }
 
     #[test]

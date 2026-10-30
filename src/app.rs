@@ -861,6 +861,7 @@ pub struct App {
     config: PluginConfigState,
     /// The last theme name requested, so re-resolving the same name skips work and logging.
     requested_theme_name: Option<String>,
+    requested_diff_colors: crate::roles::Overrides,
     cache: DiffCache,
     /// The markdown render memo, filled by the renderer from `&App`.
     markdown_cache: std::cell::RefCell<crate::markdown::RenderCache>,
@@ -911,7 +912,7 @@ struct PaintedDetails {
 
 #[derive(Debug)]
 enum PluginConfigState {
-    Ready(crate::config::PluginConfig),
+    Ready(Box<crate::config::PluginConfig>),
     Blocked { error: String },
 }
 
@@ -1031,8 +1032,9 @@ impl App {
             palette: theme.palette,
             theme_name: theme.name,
             cli_theme_name: None,
-            config: PluginConfigState::Ready(crate::config::PluginConfig::default()),
+            config: PluginConfigState::Ready(Box::default()),
             requested_theme_name: None,
+            requested_diff_colors: crate::roles::Overrides::default(),
             cache: DiffCache::new(),
             markdown_cache: std::cell::RefCell::new(crate::markdown::RenderCache::default()),
             snippet_cache: std::cell::RefCell::new(crate::snippet::SnippetRowCache::default()),
@@ -1041,14 +1043,15 @@ impl App {
     }
 
     /// Apply theme `name` when it changes, rebuilding the highlighter and caches.
-    fn set_theme(&mut self, name: Option<&str>) {
-        // An unchanged name skips re-deriving and re-logging.
-        if self.requested_theme_name.as_deref() == name {
+    fn set_theme(&mut self, name: Option<&str>, diff: crate::roles::Overrides) {
+        // An unchanged name and colors skip re-deriving and re-logging.
+        if self.requested_theme_name.as_deref() == name && self.requested_diff_colors == diff {
             return;
         }
         self.requested_theme_name = name.map(str::to_owned);
-        let theme = theme::resolve(name);
-        if theme.name != self.theme_name {
+        self.requested_diff_colors = diff;
+        let theme = theme::resolve_with(name, diff);
+        if theme.name != self.theme_name || theme.palette != self.palette {
             self.theme_name = theme.name;
             self.palette = theme.palette;
             self.highlighter = Highlighter::new(theme.syntax);
@@ -1069,7 +1072,7 @@ impl App {
         let previous_position =
             self.plugin_config().map(crate::config::PluginConfig::navigator_position);
         let next_position = config.navigator_position();
-        self.config = PluginConfigState::Ready(config);
+        self.config = PluginConfigState::Ready(Box::new(config));
         if previous_position != Some(next_position) {
             self.cancel_divider_drag();
             self.navigator_position = next_position;
@@ -1233,7 +1236,8 @@ impl App {
             .cli_theme_name
             .clone()
             .unwrap_or_else(|| self.config_snapshot().theme().to_owned());
-        self.set_theme(Some(&name));
+        let diff = self.config_snapshot().diff_colors();
+        self.set_theme(Some(&name), diff);
     }
 
     /// The active palette every renderer paints from.

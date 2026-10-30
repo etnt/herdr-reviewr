@@ -1590,7 +1590,7 @@ fn reconcile_plugin_config(
     if pr_changed {
         pr.config_changed(app.tab == crate::app::Tab::Pr);
     }
-    if previous.theme() != current.theme() {
+    if previous.theme() != current.theme() || previous.diff_colors() != current.diff_colors() {
         // A theme change rebuilds the highlighted diffs before anything mixes states.
         if let Err(error) = app.reload() {
             app.status = format!("config refresh failed: {error}");
@@ -1625,7 +1625,9 @@ fn recovery_verdict(
 fn config_ends_gesture(previous: &PluginConfig, observed: Option<&PluginConfig>) -> bool {
     match observed {
         Some(c) => {
-            previous.navigator_position() != c.navigator_position() || previous.theme() != c.theme()
+            previous.navigator_position() != c.navigator_position()
+                || previous.theme() != c.theme()
+                || previous.diff_colors() != c.diff_colors()
         }
         None => true,
     }
